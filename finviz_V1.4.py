@@ -353,7 +353,7 @@ BASIC_METRICS = [
     "Gross Margin", "Oper Margin", "Profit Margin", 
     "Return on Assets", "Return on Equity", "Return on Invested Capital",
     "P/Free Cash Flow", "Institutional Transactions", "Insider Transactions", 
-    "Short Float", "Relative Volume", "Forward P/E", "P/B", "P/S", "P/C",
+    "Short Float", "Relative Volume", "Forward P/E", "P/E", "P/B", "P/S", "P/C",
     "EPS Growth Next Year", "EPS Growth Next 5 Years", "EPS Growth This Year",
     "20-Day Simple Moving Average", "50-Day Simple Moving Average",
     "200-Day Simple Moving Average", "Relative Strength Index (14)",
@@ -1154,3 +1154,4 @@ if st.session_state.get('selected_ticker'):
 
 
     
+
