@@ -54,15 +54,26 @@ def get_all_financial_source(tickers):
 def fetch_ml_data_optimized_pit(tickers, ref_date, full_hist_data, source_cache, is_training=True):
     features_list = []
     ref_dt = pd.to_datetime(ref_date)
+
+    # [로그] 분석 시작 알림
+    mode = "학습용" if is_training else "추론용"
+    print(f"\n[INFO] {ref_dt.strftime('%Y-%m-%d')} 기준 {mode} 데이터 생성 시작 (대상 티커: {len(tickers)}개)")
+    
+    success_count = 0
+    fail_reasons = {"No_Price": 0, "Short_Hist": 0, "No_Financials": 0, "No_Target": 0}
     
     for ticker in tickers:
         try:
-            if ticker not in full_hist_data.columns.get_level_values(0): continue
+            if ticker not in full_hist_data.columns.get_level_values(0): 
+                fail_reasons["No_Price"] += 1
+                continue
             
             ticker_all_prices = full_hist_data[ticker].dropna()
             # [수정] 기준일(ref_dt) 이전의 데이터만 사용하여 지표 계산
             hist = ticker_all_prices[ticker_all_prices.index < ref_dt].tail(504)
-            if len(hist) < 252: continue
+            if len(hist) < 252:
+                fail_reasons["Short_Hist"] += 1
+                continue
             
             close_now = hist['Close'].iloc[-1]
             src = source_cache.get(ticker, {})
@@ -75,6 +86,10 @@ def fetch_ml_data_optimized_pit(tickers, ref_date, full_hist_data, source_cache,
                 return df[df.index < ref_dt] if not df.empty else pd.DataFrame()
 
             past_fin = get_fallback_data('q_fin', 'a_fin', ref_dt)
+            if past_fin.empty:
+                # 재무 데이터가 없어도 가격 데이터로 계산은 진행되지만, 로그로 남김
+                fail_reasons["No_Financials"] += 1
+            
             past_bal = get_fallback_data('q_bal', 'a_bal', ref_dt)
             past_cf = get_fallback_data('q_cf', 'a_cf', ref_dt)
             
@@ -145,7 +160,12 @@ def fetch_ml_data_optimized_pit(tickers, ref_date, full_hist_data, source_cache,
                     continue # 미래 데이터 부족 시 학습에서 제외
 
             features_list.append(data)
-        except: continue
+        except Exception as e:
+            print(f"[ERROR] {ticker} 처리 중 예외 발생: {e}")
+            continue
+
+    # [로그] 요약 결과 출력
+    print(f"[SUMMARY] 성공: {success_count}개 / 가격미비: {fail_reasons['No_Price']} / 기간부족: {fail_reasons['Short_Hist']} / 재무미비: {fail_reasons['No_Financials']} / 타겟부족: {fail_reasons['No_Target']}")
     return pd.DataFrame(features_list).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 # 시각화 함수 (절대 변경 안함)
