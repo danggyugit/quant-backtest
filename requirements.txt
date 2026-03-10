@@ -11,3 +11,6 @@ finvizfinance
 yfinance
 numpy
 lxml
+requests
+seaborn
+quantstats
