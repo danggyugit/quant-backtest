@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import seaborn as sns
 from datetime import datetime, timedelta
 import concurrent.futures
+import time
 
 # 페이지 설정
 st.set_page_config(page_title="Advanced AI Quant Lab", layout="wide")
@@ -30,24 +31,45 @@ def get_sp500_info():
 @st.cache_data(show_spinner=False)
 def get_all_financial_source(tickers):
     data_cache = {}
-    def fetch(t):
-        try:
-            tk = yf.Ticker(t)
-            return t, {
-                'q_fin': tk.quarterly_financials.T, 
-                'q_bal': tk.quarterly_balance_sheet.T, 
-                'q_cf': tk.quarterly_cashflow.T,
-                'a_fin': tk.financials.T, 
-                'a_bal': tk.balance_sheet.T, 
-                'a_cf': tk.cashflow.T,
-                'info': tk.info
-            }
-        except: return t, None
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # 1. 세션 및 재시도 설정
+    session = requests.Session()
+    retry = requests.packages.urllib3.util.retry.Retry(
+        total=5, 
+        backoff_factor=1, 
+        status_forcelist=[429, 500, 502, 503, 504]
+    )
+    adapter = requests.adapters.HTTPAdapter(max_retries=retry)
+    session.mount('https://', adapter)
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+    def fetch(t):
+        time.sleep(0.5)
+        try:
+            tk = yf.Ticker(t, session=session)
+            q_fin = tk.quarterly_financials.T
+            if q_fin.empty:
+                # 가끔 데이터가 늦게 로드되므로 한 번 더 명시적 호출
+                q_fin = tk.get_params().get('quarterly_financials', pd.DataFrame()).T
+            return t, {
+                    'q_fin': tk.quarterly_financials.T, 
+                    'q_bal': tk.quarterly_balance_sheet.T, 
+                    'q_cf': tk.quarterly_cashflow.T,
+                    'a_fin': tk.financials.T, 
+                    'a_bal': tk.balance_sheet.T, 
+                    'a_cf': tk.cashflow.T,
+                    'info': tk.info
+                }
+        except Exception as e: 
+            print(f"[RETRY_FAIL] {t} 데이터 확보 실패: {e}")
+            return t, None
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         results = list(executor.map(fetch, tickers))
+        
     for t, val in results:
-        if val: data_cache[t] = val
+        if val and not val['q_fin'].empty: 
+            data_cache[t] = val
+            
     return data_cache
 
 # 데이터 추출 함수
