@@ -35,7 +35,8 @@ def get_all_financial_source(tickers):
     def fetch(t):
         # 1. 서버 차단을 피하기 위해 실행 시점을 랜덤하게 분산 (중요!)
         import random
-        time.sleep(random.uniform(1.0, 3.0)) 
+        # 2, 3, 4, 5 중에서 하나를 무작위 선택
+        time.sleep(random.choice([2.0, 3.0, 4.0, 5.0]))
         
         try:
             # 2. session을 넣지 말고, 직접 Ticker 객체 생성
@@ -96,9 +97,29 @@ def fetch_ml_data_optimized_pit(tickers, ref_date, full_hist_data, source_cache,
             
             def get_fallback_data(q_key, a_key, ref_dt):
                 df = src.get(q_key, pd.DataFrame())
-                if df.empty or (df.index < ref_dt).sum() == 0:
+                if df.empty:
                     df = src.get(a_key, pd.DataFrame())
-                return df[df.index < ref_dt] if not df.empty else pd.DataFrame()
+                
+                if df.empty: return pd.DataFrame()
+
+                # [로직 변경] 기준일(ref_dt)과 각 데이터 날짜의 차이를 계산
+                # 기준일보다 미래여도, 그 차이가 31일 이내라면 '당일 시점 데이터'로 인정 (CASE 1 대응)
+                # 기준일보다 과거라면 당연히 인정 (CASE 2 대응)
+                
+                # 1. 날짜 차이 계산 (기준일 - 데이터일)
+                # diff가 0보다 크면 과거, -31보다 크면 한 달 이내의 미래
+                time_diffs = (ref_dt - df.index).days
+                
+                # 2. 조건에 맞는 데이터 필터링: 기준일 이전이거나, 기준일 후 31일 이내인 것
+                valid_mask = (time_diffs >= -31) 
+                valid_df = df[valid_mask]
+
+                if not valid_df.empty:
+                    # 기준일과 가장 가까운(절대값 차이가 작은) 데이터를 반환
+                    closest_idx = np.abs(ref_dt - valid_df.index).argmin()
+                    return valid_df.iloc[[closest_idx]]
+                
+                return pd.DataFrame()
 
             past_fin = get_fallback_data('q_fin', 'a_fin', ref_dt)
             past_bal = get_fallback_data('q_bal', 'a_bal', ref_dt)
