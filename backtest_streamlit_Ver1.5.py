@@ -36,7 +36,7 @@ def get_all_financial_source(tickers):
         # 1. 서버 차단을 피하기 위해 실행 시점을 랜덤하게 분산 (중요!)
         import random
         # 2, 3, 4, 5 중에서 하나를 무작위 선택
-        time.sleep(random.choice([2.0, 5.0]))
+        time.sleep(random.choice([2.0, 3.0]))
         
         try:
             # 2. session을 넣지 말고, 직접 Ticker 객체 생성
@@ -96,29 +96,34 @@ def fetch_ml_data_optimized_pit(tickers, ref_date, full_hist_data, source_cache,
             info = src.get('info', {})
             
             def get_fallback_data(q_key, a_key, ref_dt):
-                df = src.get(q_key, pd.DataFrame())
-                if df.empty:
-                    df = src.get(a_key, pd.DataFrame())
+                q_df = src.get(q_key, pd.DataFrame())
+                a_df = src.get(a_key, pd.DataFrame())
                 
-                if df.empty: return pd.DataFrame()
+                # 2. 강제 통합 및 인덱스 정렬
+                combined = pd.concat([q_df, a_df]).sort_index(ascending=False)
+                # 중복 제거 (날짜가 겹치면 분기 데이터를 우선시)
+                combined = combined[~combined.index.duplicated(keep='first')]
+                
+                if combined.empty: return pd.DataFrame()
 
-                # [로직 변경] 기준일(ref_dt)과 각 데이터 날짜의 차이를 계산
-                # 기준일보다 미래여도, 그 차이가 31일 이내라면 '당일 시점 데이터'로 인정 (CASE 1 대응)
-                # 기준일보다 과거라면 당연히 인정 (CASE 2 대응)
+                # 3. 기준일(ref_dt) 기반 필터링 (동규님 로직 반영)
+                # 기준일 + 45일 이내의 모든 과거/현재 데이터
+                valid_df = combined[combined.index <= (ref_dt + pd.Timedelta(days=45))]
                 
-                # 1. 날짜 차이 계산 (기준일 - 데이터일)
-                # diff가 0보다 크면 과거, -31보다 크면 한 달 이내의 미래
-                time_diffs = (ref_dt - df.index).days
-                
-                # 2. 조건에 맞는 데이터 필터링: 기준일 이전이거나, 기준일 후 31일 이내인 것
-                valid_mask = (time_diffs >= -31) 
-                valid_df = df[valid_mask]
-
                 if not valid_df.empty:
-                    # 기준일과 가장 가까운(절대값 차이가 작은) 데이터를 반환
-                    closest_idx = np.abs(ref_dt - valid_df.index).argmin()
-                    return valid_df.iloc[[closest_idx]]
-                
+                    # 가장 가까운 시점의 행 1개를 선택
+                    idx_min = np.abs((valid_df.index - ref_dt).days).argmin()
+                    row = valid_df.iloc[[idx_min]].copy()
+                    
+                    # [핵심 보정] 만약 선택된 행의 'Net Income' 등 주요 지표가 NaN이거나 0이라면?
+                    # 해당 열에서 NaN이 아닌 가장 가까운 과거 값을 다시 탐색 (Fillna 방식)
+                    if row.get('Net Income', pd.Series([0])).iloc[0] == 0 or pd.isna(row.get('Net Income', pd.Series([np.nan])).iloc[0]):
+                        # 전체 데이터셋에서 해당 컬럼의 유효한 값을 위에서 아래로(최신순) 다시 채움
+                        combined_filled = combined.fillna(method='bfill').fillna(method='ffill')
+                        row = combined_filled.loc[[row.index[0]]]
+                        
+                    return row
+                    
                 return pd.DataFrame()
 
             past_fin = get_fallback_data('q_fin', 'a_fin', ref_dt)
@@ -134,6 +139,8 @@ def fetch_ml_data_optimized_pit(tickers, ref_date, full_hist_data, source_cache,
             mkt_cap = close_now * shares
             
             net_income = cur.get('Net Income', 0); revenue = cur.get('Total Revenue', 0)
+            #net_income = cur.filter(like='Net Income').iloc[0] if not cur.filter(like='Net Income').empty else 0
+            #revenue = cur.filter(like='Revenue').iloc[0] if not cur.filter(like='Revenue').empty else 0
             gross_profit = cur.get('Gross Profit', 0); total_assets = bal.get('Total Assets', 1)
             fcf = cf.get('Free Cash Flow', 0)
             ebit = cur.get('EBIT', 0)
@@ -478,4 +485,3 @@ if run_analysis:
                     )
 else:
     st.info("섹터를 선택하고 백테스트를 실행하세요.")
-
