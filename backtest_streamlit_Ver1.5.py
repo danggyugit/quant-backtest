@@ -36,7 +36,7 @@ def get_all_financial_source(tickers):
         # 1. 서버 차단을 피하기 위해 실행 시점을 랜덤하게 분산 (중요!)
         import random
         # 2, 3, 4, 5 중에서 하나를 무작위 선택
-        time.sleep(random.choice([2.0, 3.0, 4.0, 5.0]))
+        time.sleep(random.choice([2.0, 5.0]))
         
         try:
             # 2. session을 넣지 말고, 직접 Ticker 객체 생성
@@ -478,3 +478,4 @@ if run_analysis:
                     )
 else:
     st.info("섹터를 선택하고 백테스트를 실행하세요.")
+
