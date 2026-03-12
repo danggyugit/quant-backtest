@@ -33,11 +33,18 @@ def get_all_financial_source(tickers):
     data_cache = {}
     
     def fetch(t):
+        # 1. 서버 차단을 피하기 위해 실행 시점을 랜덤하게 분산 (중요!)
+        import random
+        time.sleep(random.uniform(1.0, 3.0)) 
+        
         try:
-            # session=session을 제거했습니다. yf가 알아서 curl_cffi를 쓰게 둡니다.
+            # 2. session을 넣지 말고, 직접 Ticker 객체 생성
             tk = yf.Ticker(t)
             
-            # 데이터 로드 대기 (안정성을 위해 살짝 늦춤)
+            # 3. 데이터가 즉시 안 올 수 있으므로 'info'를 먼저 호출해서 깨워줌
+            _ = tk.info 
+            
+            # 4. 재무제표 시도 (분기 -> 연간 순서)
             q_fin = tk.quarterly_financials
             if q_fin is None or q_fin.empty:
                 q_fin = tk.financials
@@ -45,20 +52,23 @@ def get_all_financial_source(tickers):
             if q_fin is None or q_fin.empty:
                 return t, None
 
+            # 5. 모든 데이터가 정상일 때만 수집
             return t, {
                 'q_fin': q_fin.T, 
-                'q_bal': tk.quarterly_balance_sheet.T, 
-                'q_cf': tk.quarterly_cashflow.T,
+                'q_bal': tk.quarterly_balance_sheet.T if tk.quarterly_balance_sheet is not None else pd.DataFrame(), 
+                'q_cf': tk.quarterly_cashflow.T if tk.quarterly_cashflow is not None else pd.DataFrame(),
                 'a_fin': tk.financials.T, 
                 'a_bal': tk.balance_sheet.T, 
                 'a_cf': tk.cashflow.T,
-                'info': tk.info if tk.info else {}
+                'info': tk.info
             }
-        except:
+        except Exception as e:
             return t, None
 
-    # max_workers를 5 정도로 조절하여 안정성 확보
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    # 6. 클라우드 서버에서는 병렬 처리를 '포기'해야 합니다. 
+    # 여러 명이 동시에 요청하는 것처럼 보이면 바로 차단당합니다.
+    # 속도는 느리지만 '확실하게' 가져오기 위해 max_workers=1 또는 2로 낮춥니다.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(fetch, tickers))
     
     for t, val in results:
