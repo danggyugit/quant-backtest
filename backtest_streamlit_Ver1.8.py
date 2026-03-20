@@ -195,6 +195,68 @@ def _get_pit_row(src: dict, q_key: str, a_key: str, ref_dt: pd.Timestamp) -> pd.
 
 
 # ─────────────────────────────────────────────
+# 리밸런싱 메타 정보 수집
+#  - 백테스트 실제 기간 (hist 첫날 ~ 기준일)
+#  - 종목별 분기/연간 데이터 사용 여부
+# ─────────────────────────────────────────────
+def get_rebalance_meta(tickers, ref_date, full_hist_data, source_cache):
+    """
+    반환:
+        period_start : 백테스트에 사용된 주가 데이터 시작일
+        period_end   : 기준일 (= ref_date)
+        data_types   : {ticker: "분기" | "연간(분기 대체)" | "없음"}
+    """
+    ref_dt = pd.to_datetime(ref_date)
+    all_level0 = set(full_hist_data.columns.get_level_values(0))
+
+    period_starts = []
+    data_types: dict = {}
+
+    for ticker in tickers:
+        if ticker not in all_level0:
+            continue
+        ticker_prices = full_hist_data[ticker].dropna(how="all")
+        hist = ticker_prices[ticker_prices.index < ref_dt].tail(252)
+        if len(hist) < 252:
+            continue
+        period_starts.append(hist.index[0])
+
+        src   = source_cache.get(ticker, {})
+        q_fin = src.get("q_fin", pd.DataFrame())
+        a_fin = src.get("a_fin", pd.DataFrame())
+
+        # 기준일 기준으로 유효한 분기 데이터 존재 여부 확인
+        q_valid = q_fin[q_fin.index <= (ref_dt + pd.Timedelta(days=45))] if not q_fin.empty else pd.DataFrame()
+        a_valid = a_fin[a_fin.index <= (ref_dt + pd.Timedelta(days=45))] if not a_fin.empty else pd.DataFrame()
+
+        if not q_valid.empty:
+            data_types[ticker] = "분기"
+        elif not a_valid.empty:
+            data_types[ticker] = "연간(분기 대체)"
+        else:
+            data_types[ticker] = "없음"
+
+    period_start = min(period_starts).strftime("%Y-%m-%d") if period_starts else "N/A"
+    period_end   = ref_dt.strftime("%Y-%m-%d")
+
+    # 전체 요약: 분기/연간 비율
+    total = len(data_types)
+    q_count = sum(1 for v in data_types.values() if v == "분기")
+    a_count = sum(1 for v in data_types.values() if v == "연간(분기 대체)")
+    n_count = sum(1 for v in data_types.values() if v == "없음")
+
+    return {
+        "period_start": period_start,
+        "period_end":   period_end,
+        "data_types":   data_types,
+        "q_count":  q_count,
+        "a_count":  a_count,
+        "n_count":  n_count,
+        "total":    total,
+    }
+
+
+# ─────────────────────────────────────────────
 # ML 피처 추출 (Point-in-Time)
 # ─────────────────────────────────────────────
 def fetch_ml_data_optimized_pit(
@@ -473,10 +535,16 @@ if run_analysis:
 
         importances = pd.Series(latest_model.feature_importances_, index=final_model_columns)
         importance_history.append({"Date": curr_reb.strftime("%Y-%m-%d"), **importances.to_dict()})
+
+        # 메타 정보 수집 (백테스트 기간 + 데이터 타입)
+        meta = get_rebalance_meta(tickers, curr_reb, full_hist_data, source_cache)
+
         rebalance_details.append({
-            "date": curr_reb.strftime("%Y-%m-%d"),
+            "date":         curr_reb.strftime("%Y-%m-%d"),
+            "next_date":    next_reb.strftime("%Y-%m-%d"),
             "selected_data": selected_rows,
-            "importance": importances,
+            "importance":   importances,
+            "meta":         meta,
         })
 
         valid_sel = [t for t in sel_tickers if t in full_hist_data.columns.get_level_values(0)]
@@ -573,18 +641,63 @@ if run_analysis:
     st.subheader("🗓️ 리밸런싱 히스토리")
 
     for detail in reversed(rebalance_details):
-        curr_date_obj = pd.to_datetime(detail["date"])
-        check_cols    = [c for c in ["P/E", "ROE"] if c in detail["selected_data"].columns]
-        has_fin       = (
+        meta       = detail.get("meta", {})
+        check_cols = [c for c in ["P/E", "ROE"] if c in detail["selected_data"].columns]
+        has_fin    = (
             not (detail["selected_data"][check_cols].abs() < 0.0001).all().all()
             if check_cols else False
         )
-        status_suffix = " ✅ (재무+가격)" if has_fin else " ⚠️ (모멘텀 중심)"
 
-        with st.expander(f"📅 {detail['date']}{status_suffix}", expanded=False):
+        # ── 분기/연간 비율 계산 ──────────────────────────────────
+        q_count = meta.get("q_count", 0)
+        a_count = meta.get("a_count", 0)
+        n_count = meta.get("n_count", 0)
+        total   = meta.get("total",   1) or 1
+
+        if q_count / total >= 0.7:
+            data_badge = "🟢 분기 데이터"
+        elif a_count / total >= 0.5:
+            data_badge = "🟡 연간(분기 대체)"
+        else:
+            data_badge = "🔴 데이터 부족"
+
+        fin_badge     = "✅ 재무+가격" if has_fin else "⚠️ 모멘텀 중심"
+        period_start  = meta.get("period_start", "N/A")
+        period_end    = meta.get("period_end",   detail["date"])
+        next_date     = detail.get("next_date",  "N/A")
+
+        expander_label = (
+            f"📅 {detail['date']}  |  {fin_badge}  |  {data_badge}"
+        )
+
+        with st.expander(expander_label, expanded=False):
+
+            # ── 상단 메타 정보 배지 행 ───────────────────────────
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("📆 리밸런싱 기준일",  detail["date"])
+            m2.metric("📈 보유 기간",        f"{period_end} ~ {next_date}")
+            m3.metric("📊 주가 학습 기간",   f"{period_start} ~ {period_end}")
+            m4.metric("🗃️ 재무 데이터",
+                      f"분기 {q_count}개 / 연간 {a_count}개 / 없음 {n_count}개")
+
+            st.divider()
+
+            # ── 종목별 데이터 타입 태그 ──────────────────────────
+            data_types = meta.get("data_types", {})
+            sel_tickers_in_detail = detail["selected_data"]["Ticker"].tolist() if "Ticker" in detail["selected_data"].columns else []
+            if data_types and sel_tickers_in_detail:
+                tag_parts = []
+                for t in sel_tickers_in_detail:
+                    dtype = data_types.get(t, "없음")
+                    icon  = "🟢" if dtype == "분기" else ("🟡" if dtype == "연간(분기 대체)" else "🔴")
+                    tag_parts.append(f"{icon} **{t}** ({dtype})")
+                st.markdown("**선정 종목 데이터 타입:**  " + "  ·  ".join(tag_parts))
+                st.divider()
+
+            # ── 선정 종목 테이블 + 중요도 차트 ──────────────────
             d1, d2 = st.columns([3, 2])
             with d1:
-                st.markdown("**선정 종목**")
+                st.markdown("**선정 종목 상세**")
                 st.dataframe(
                     detail["selected_data"].drop(
                         columns=["Target_Return", "Prediction"], errors="ignore"
