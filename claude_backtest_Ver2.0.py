@@ -97,8 +97,13 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════
-IS_CLOUD    = os.environ.get("STREAMLIT_SERVER_HEADLESS", "0") == "1"
-MAX_WORKERS = 2 if IS_CLOUD else 8
+IS_CLOUD = any([
+    os.environ.get("STREAMLIT_SERVER_HEADLESS", "").lower() in ("1", "true"),
+    os.environ.get("STREAMLIT_SHARING_MODE", "") != "",
+    os.environ.get("HOME", "") == "/home/appuser",   # Streamlit Cloud 기본 홈
+])
+MAX_WORKERS  = 1 if IS_CLOUD else 6   # 클라우드: 동시 요청 최소화
+CLOUD_DELAY  = 0.4 if IS_CLOUD else 0.0  # 클라우드: 요청 간 딜레이(초)
 REPORT_LAG  = 45  # 재무보고 지연일
 
 BENCHMARKS = {"SPY": "S&P 500", "QQQ": "Nasdaq 100", "TQQQ": "3x Nasdaq"}
@@ -254,28 +259,34 @@ def _fallback_sectors() -> list:
 def download_price_data(tickers: tuple, start: str, end: str) -> dict:
     """yfinance에서 OHLCV 데이터 일괄 다운로드."""
     result = {}
-    batch = 20
+    batch = 10 if IS_CLOUD else 20   # 클라우드: 배치 크기 줄여 안정성 확보
     tlist = list(tickers)
     for i in range(0, len(tlist), batch):
         chunk = tlist[i: i + batch]
-        try:
-            raw = yf.download(chunk, start=start, end=end,
-                              auto_adjust=True, progress=False, threads=True)
-            if raw.empty:
-                continue
-            if isinstance(raw.columns, pd.MultiIndex):
-                for t in chunk:
-                    try:
-                        sub = raw.xs(t, axis=1, level=1).dropna(how="all")
-                        if len(sub) >= 60:
-                            result[t] = sub
-                    except Exception:
-                        pass
-            else:
-                if len(chunk) == 1 and len(raw) >= 60:
-                    result[chunk[0]] = raw
-        except Exception:
-            pass
+        for attempt in range(3):   # 최대 3회 재시도
+            try:
+                raw = yf.download(chunk, start=start, end=end,
+                                  auto_adjust=True, progress=False,
+                                  threads=(not IS_CLOUD))  # 클라우드: 단일 스레드
+                if raw.empty:
+                    break
+                if isinstance(raw.columns, pd.MultiIndex):
+                    for t in chunk:
+                        try:
+                            sub = raw.xs(t, axis=1, level=1).dropna(how="all")
+                            if len(sub) >= 60:
+                                result[t] = sub
+                        except Exception:
+                            pass
+                else:
+                    if len(chunk) == 1 and len(raw) >= 60:
+                        result[chunk[0]] = raw
+                break  # 성공 시 재시도 루프 탈출
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1.5 ** attempt)  # 0s, 1.5s 후 재시도
+        if CLOUD_DELAY and i + batch < len(tlist):
+            time.sleep(CLOUD_DELAY)   # 배치 간 딜레이
     return result
 
 
@@ -284,8 +295,15 @@ def get_fundamental_yf(tickers: tuple) -> dict:
     """yfinance .info에서 펀더멘털 데이터 취득."""
     out = {}
     for t in tickers:
+        info = {}
+        for attempt in range(3):   # 최대 3회 재시도
+            try:
+                info = yf.Ticker(t).info or {}
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)  # 1s, 2s 후 재시도
         try:
-            info = yf.Ticker(t).info or {}
             mkt  = info.get("marketCap", 0) or 0
             out[t] = {
                 "pe":         info.get("trailingPE", np.nan),
@@ -321,6 +339,8 @@ def get_fundamental_yf(tickers: tuple) -> dict:
             }
         except Exception:
             out[t] = {}
+        if CLOUD_DELAY:
+            time.sleep(CLOUD_DELAY)   # 종목 간 딜레이 (rate limit 방지)
     return out
 
 
