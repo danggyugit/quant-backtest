@@ -704,7 +704,7 @@ def run_backtest(
 
         model = RandomForestRegressor(
             n_estimators=100, max_depth=5, min_samples_leaf=3,
-            random_state=42, n_jobs=-1
+            random_state=42, n_jobs=1   # n_jobs=-1은 CPU수 따라 부동소수점 결과 달라짐
         )
         model.fit(X_imp, y_train)
 
@@ -1591,7 +1591,8 @@ def main():
 
         # 2. 펀더멘털 데이터
         fund_map = get_fundamental_yf(tuple(available))
-        update_prog(0.20, "🔧 기술지표 사전 계산 중...")
+        fund_ok  = sum(1 for v in fund_map.values() if v)
+        update_prog(0.20, f"✅ 펀더멘털 완료: {fund_ok}/{len(available)}개. 기술지표 계산 중...")
 
         # 3. 기술지표 사전 계산
         tech_map = {}
