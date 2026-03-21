@@ -1,815 +1,1693 @@
+#!/usr/bin/env python3
+"""
+claude_backtest_Ver2.0.py
+AI 퀀트 백테스팅 & 실시간 종목 추천 플랫폼
+"""
+
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestRegressor
-import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
+from scipy.stats import spearmanr
 import requests
 from io import StringIO
-import quantstats as qs
-import plotly.express as px
-import seaborn as sns
-from datetime import datetime, timedelta
+import warnings
 import concurrent.futures
 import time
 import random
 import os
+import calendar
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Advanced AI Quant Lab", layout="wide")
+warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────
-# 환경 감지 — 로컬 vs Streamlit Cloud
-# ─────────────────────────────────────────────
-IS_CLOUD = os.environ.get("STREAMLIT_SERVER_HEADLESS", "0") == "1"
+# ═══════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ═══════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="AI Quant Lab 2.0",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-MAX_WORKERS  = 2        if IS_CLOUD else 8
-SLEEP_JITTER = (2.0, 4.0) if IS_CLOUD else (0.5, 1.5)   # 재시도 백오프 지터
-RETRY_SLEEP  = (4.0, 7.0) if IS_CLOUD else (2.0, 3.5)   # 2차 순차 재시도 대기
+st.markdown("""
+<style>
+    /* ── 전체 배경 흰색 ── */
+    .stApp { background: #ffffff; }
+    section[data-testid="stSidebar"] { display: none; }
+
+    .main-title {
+        font-size: 2.0rem; font-weight: 800;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        margin-bottom: 0.1rem;
+    }
+    .sub-title { font-size: 0.9rem; color: #555; margin-bottom: 0.8rem; }
+    .section-hdr {
+        font-size: 0.95rem; font-weight: 700; color: #1565c0;
+        margin: 0.8rem 0 0.4rem 0; padding-bottom: 0.2rem;
+        border-bottom: 2px solid #e3f2fd;
+    }
+    .metric-box {
+        background: #f5f7fa; border-radius: 8px; padding: 0.7rem 1rem;
+        border: 1px solid #dee2e6; text-align: center; margin-bottom: 0.3rem;
+    }
+    .metric-label { font-size: 0.7rem; color: #555; }
+    .metric-value { font-size: 1.2rem; font-weight: 700; }
+    .pos { color: #2e7d32; } .neg { color: #c62828; } .neu { color: #1565c0; }
+
+    /* ── 상단 설정 바 ── */
+    .settings-bar {
+        background: #f8f9fa; border-radius: 10px; padding: 1rem 1.2rem;
+        border: 1px solid #dee2e6; margin-bottom: 1rem;
+    }
+    .settings-title {
+        font-size: 1rem; font-weight: 700; color: #333; margin-bottom: 0.5rem;
+    }
+
+    /* ── Streamlit 기본 요소 색상 보정 ── */
+    .stSlider > label { color: #222 !important; font-weight: 600; }
+    .stNumberInput > label { color: #222 !important; font-weight: 600; }
+    .stMultiSelect > label { color: #222 !important; font-weight: 600; }
+    .stCheckbox > label { color: #222 !important; }
+    .stDateInput > label { color: #222 !important; font-weight: 600; }
+    div[data-testid="stExpander"] summary p { color: #222 !important; font-weight: 700; }
+
+    /* ── 탭 스타일 ── */
+    .stTabs [data-baseweb="tab-list"] { gap: 0.3rem; }
+    .stTabs [data-baseweb="tab"] {
+        font-size: 0.82rem; font-weight: 600; color: #444;
+    }
+    .stTabs [aria-selected="true"] { color: #1565c0 !important; }
+
+    /* ── 모바일 대응 ── */
+    @media (max-width: 768px) {
+        .main-title { font-size: 1.4rem; }
+        .metric-value { font-size: 1rem; }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════
+IS_CLOUD = any([
+    os.environ.get("STREAMLIT_SERVER_HEADLESS", "").lower() in ("1", "true"),
+    os.environ.get("STREAMLIT_SHARING_MODE", "") != "",
+    os.environ.get("HOME", "") == "/home/appuser",   # Streamlit Cloud 기본 홈
+])
+MAX_WORKERS  = 1 if IS_CLOUD else 6   # 클라우드: 동시 요청 최소화
+CLOUD_DELAY  = 0.4 if IS_CLOUD else 0.0  # 클라우드: 요청 간 딜레이(초)
+REPORT_LAG  = 45  # 재무보고 지연일
+
+BENCHMARKS = {"SPY": "S&P 500", "QQQ": "Nasdaq 100", "TQQQ": "3x Nasdaq"}
+
+FEATURE_META = {
+    # ── 모멘텀 ──────────────────────────────────────────────
+    "Mom_1w":            {"name": "1주 수익률",        "group": "모멘텀"},
+    "Mom_1m":            {"name": "1개월 수익률",      "group": "모멘텀"},
+    "Mom_3m":            {"name": "3개월 수익률",      "group": "모멘텀"},
+    "Mom_6m":            {"name": "6개월 수익률",      "group": "모멘텀"},
+    "Mom_12m":           {"name": "12개월 수익률",     "group": "모멘텀"},
+    "Mom_12_1":          {"name": "12-1개월 모멘텀",   "group": "모멘텀"},
+    "Mom_6_1":           {"name": "6-1개월 모멘텀",    "group": "모멘텀"},
+    "Momentum_Custom":   {"name": "3개월 커스텀",      "group": "모멘텀"},
+    # ── 기술지표 ─────────────────────────────────────────────
+    "RSI_14":            {"name": "RSI(14)",            "group": "기술지표"},
+    "MACD_Hist":         {"name": "MACD 히스토그램",   "group": "기술지표"},
+    "Price_SMA20":       {"name": "Price/SMA20",        "group": "기술지표"},
+    "Price_SMA50":       {"name": "Price/SMA50",        "group": "기술지표"},
+    "Price_SMA200":      {"name": "Price/SMA200",       "group": "기술지표"},
+    "SMA50_SMA200":      {"name": "SMA50/SMA200 골든",  "group": "기술지표"},
+    "ADX_14":            {"name": "ADX(14)",            "group": "기술지표"},
+    "Stoch_K":           {"name": "Stochastic %K",      "group": "기술지표"},
+    "CCI_20":            {"name": "CCI(20)",            "group": "기술지표"},
+    "WilliamsR_14":      {"name": "Williams %R(14)",    "group": "기술지표"},
+    "MFI_14":            {"name": "MFI(14)",            "group": "기술지표"},
+    "BB_Width":          {"name": "볼린저밴드 폭",      "group": "기술지표"},
+    "BB_Pos":            {"name": "볼린저밴드 위치",    "group": "기술지표"},
+    "High52w_Dist":      {"name": "52주 고점 대비",     "group": "기술지표"},
+    "Low52w_Dist":       {"name": "52주 저점 대비",     "group": "기술지표"},
+    # ── 리스크/거래량 ─────────────────────────────────────
+    "Volatility_30d":    {"name": "30일 변동성",        "group": "리스크"},
+    "Volatility_90d":    {"name": "90일 변동성",        "group": "리스크"},
+    "ATR_Ratio":         {"name": "ATR 비율",           "group": "리스크"},
+    "Vol_Ratio":         {"name": "거래량 비율(20일)",  "group": "리스크"},
+    "Risk_Adj_Return":   {"name": "위험조정수익",       "group": "리스크"},
+    # ── 밸류에이션 ─────────────────────────────────────────
+    "P_E":               {"name": "P/E 비율",           "group": "밸류에이션"},
+    "P_B":               {"name": "P/B 비율",           "group": "밸류에이션"},
+    "P_S":               {"name": "P/S 비율",           "group": "밸류에이션"},
+    "EV_EBITDA":         {"name": "EV/EBITDA",          "group": "밸류에이션"},
+    "P_FCF":             {"name": "P/FCF",              "group": "밸류에이션"},
+    "FCF_Yield":         {"name": "FCF 수익률",         "group": "밸류에이션"},
+    "Div_Yield":         {"name": "배당수익률",         "group": "밸류에이션"},
+    "PEG_Ratio":         {"name": "PEG 비율",           "group": "밸류에이션"},
+    # ── 수익성 ─────────────────────────────────────────────
+    "ROE":               {"name": "ROE",                "group": "수익성"},
+    "ROA":               {"name": "ROA",                "group": "수익성"},
+    "Gross_Margin":      {"name": "매출총이익률",       "group": "수익성"},
+    "Op_Margin":         {"name": "영업이익률",         "group": "수익성"},
+    "EBITDA_Margin":     {"name": "EBITDA 마진",        "group": "수익성"},
+    # ── 성장성 ─────────────────────────────────────────────
+    "Rev_Growth":        {"name": "매출 성장률",        "group": "성장성"},
+    "NI_Growth":         {"name": "순이익 성장률",      "group": "성장성"},
+    "EPS_Growth":        {"name": "EPS 성장률",         "group": "성장성"},
+    # ── 재무안정성 ─────────────────────────────────────────
+    "Debt_Equity":       {"name": "부채비율",           "group": "재무안정성"},
+    "Current_Ratio":     {"name": "유동비율",           "group": "재무안정성"},
+    "Interest_Coverage": {"name": "이자보상배율",       "group": "재무안정성"},
+    # ── 효율성/규모 ────────────────────────────────────────
+    "Asset_Turnover":    {"name": "자산회전율",         "group": "효율성"},
+    "GP_A_Quality":      {"name": "GP/자산 품질",       "group": "효율성"},
+    "MktCap_Log":        {"name": "시가총액(log)",      "group": "규모"},
+}
+
+FEAT_COLS  = list(FEATURE_META.keys())
+FEAT_NAMES = {k: v["name"] for k, v in FEATURE_META.items()}
+
+PLOT_CFG = dict(
+    template="plotly_white",
+    paper_bgcolor="rgba(255,255,255,1)",
+    plot_bgcolor="rgba(248,249,250,1)",
+)
+
+# ═══════════════════════════════════════════════════════════
+# DATA LAYER
+# ═══════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sp500_info() -> tuple:
+    """Wikipedia에서 S&P 500 종목 목록 조회."""
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        df = pd.read_html(StringIO(resp.text))[0]
+        df = df.rename(columns={"Symbol": "ticker", "GICS Sector": "sector", "Security": "name"})
+        df["ticker"] = df["ticker"].str.replace(".", "-", regex=False)
+        sectors = sorted(df["sector"].dropna().unique().tolist())
+        return df[["ticker", "name", "sector"]], sectors
+    except Exception as e:
+        st.warning(f"S&P 500 목록 조회 실패: {e}. 내장 리스트 사용.")
+        return _fallback_sp500(), _fallback_sectors()
 
 
-# ─────────────────────────────────────────────
-# S&P 500 종목 리스트
-# ─────────────────────────────────────────────
-@st.cache_data
-def get_sp500_info():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    df = pd.read_html(StringIO(response.text))[0]
-    sectors = sorted(df["GICS Sector"].unique().tolist())
-    return df, sectors
+def _fallback_sp500() -> pd.DataFrame:
+    data = [
+        ("AAPL","Apple","Information Technology"),("MSFT","Microsoft","Information Technology"),
+        ("NVDA","Nvidia","Information Technology"),("GOOGL","Alphabet","Communication Services"),
+        ("META","Meta","Communication Services"),("AMZN","Amazon","Consumer Discretionary"),
+        ("TSLA","Tesla","Consumer Discretionary"),("AMD","AMD","Information Technology"),
+        ("INTC","Intel","Information Technology"),("QCOM","Qualcomm","Information Technology"),
+        ("CRM","Salesforce","Information Technology"),("ORCL","Oracle","Information Technology"),
+        ("ADBE","Adobe","Information Technology"),("TXN","TI","Information Technology"),
+        ("AVGO","Broadcom","Information Technology"),("MU","Micron","Information Technology"),
+        ("CSCO","Cisco","Information Technology"),("HPQ","HP","Information Technology"),
+        ("JNJ","J&J","Health Care"),("PFE","Pfizer","Health Care"),
+        ("UNH","UnitedHealth","Health Care"),("ABT","Abbott","Health Care"),
+        ("MRK","Merck","Health Care"),("LLY","Eli Lilly","Health Care"),
+        ("BMY","BMS","Health Care"),("AMGN","Amgen","Health Care"),
+        ("MDT","Medtronic","Health Care"),("TMO","Thermo Fisher","Health Care"),
+        ("ABBV","AbbVie","Health Care"),("CVS","CVS Health","Health Care"),
+        ("GILD","Gilead","Health Care"),("REGN","Regeneron","Health Care"),
+        ("JPM","JPMorgan","Financials"),("BAC","Bank of America","Financials"),
+        ("WFC","Wells Fargo","Financials"),("GS","Goldman","Financials"),
+        ("MS","Morgan Stanley","Financials"),("C","Citigroup","Financials"),
+        ("AXP","AmEx","Financials"),("BLK","BlackRock","Financials"),
+        ("SCHW","Schwab","Financials"),("COF","Capital One","Financials"),
+        ("HD","Home Depot","Consumer Discretionary"),("MCD","McDonald's","Consumer Discretionary"),
+        ("NKE","Nike","Consumer Discretionary"),("SBUX","Starbucks","Consumer Discretionary"),
+        ("LOW","Lowe's","Consumer Discretionary"),("TJX","TJX","Consumer Discretionary"),
+        ("PG","P&G","Consumer Staples"),("KO","Coca-Cola","Consumer Staples"),
+        ("PEP","PepsiCo","Consumer Staples"),("WMT","Walmart","Consumer Staples"),
+        ("COST","Costco","Consumer Staples"),("PM","Philip Morris","Consumer Staples"),
+        ("MO","Altria","Consumer Staples"),("CL","Colgate","Consumer Staples"),
+        ("XOM","ExxonMobil","Energy"),("CVX","Chevron","Energy"),
+        ("COP","ConocoPhillips","Energy"),("SLB","Schlumberger","Energy"),
+        ("EOG","EOG Resources","Energy"),("MPC","Marathon","Energy"),
+        ("HON","Honeywell","Industrials"),("UPS","UPS","Industrials"),
+        ("CAT","Caterpillar","Industrials"),("DE","Deere","Industrials"),
+        ("GE","GE","Industrials"),("LMT","Lockheed","Industrials"),
+        ("NEE","NextEra","Utilities"),("DUK","Duke","Utilities"),
+        ("SO","Southern","Utilities"),("D","Dominion","Utilities"),
+        ("AMT","American Tower","Real Estate"),("PLD","Prologis","Real Estate"),
+        ("CCI","Crown Castle","Real Estate"),("EQIX","Equinix","Real Estate"),
+        ("LIN","Linde","Materials"),("APD","Air Products","Materials"),
+        ("SHW","Sherwin","Materials"),("FCX","Freeport","Materials"),
+        ("NFLX","Netflix","Communication Services"),("DIS","Disney","Communication Services"),
+        ("CMCSA","Comcast","Communication Services"),("VZ","Verizon","Communication Services"),
+        ("T","AT&T","Communication Services"),
+    ]
+    return pd.DataFrame(data, columns=["ticker","name","sector"])
 
 
-# ─────────────────────────────────────────────
-# 단일 티커 재무 fetch
-#  - requests_cache 의존성 제거 (설치 문제 방지)
-#  - info 중복 호출 제거 (한 번만 호출, 저장해서 재사용)
-#  - 지수 백오프 재시도
-# ─────────────────────────────────────────────
-def _fetch_one_ticker(ticker: str) -> tuple[str, dict | None]:
-    MAX_RETRIES = 3
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            tk = yf.Ticker(ticker)
-
-            # info를 한 번만 호출해서 저장 (기존 코드는 두 번 호출)
-            info = tk.info or {}
-            if not info or len(info) < 5:
-                raise ValueError("info 응답 비어 있음")
-
-            def _safe_T(df) -> pd.DataFrame:
-                if df is None or (hasattr(df, "empty") and df.empty):
-                    return pd.DataFrame()
-                return df.T
-
-            # 분기 재무제표 우선, 없으면 연간으로 폴백
-            q_fin = tk.quarterly_financials
-            a_fin = tk.financials
-            if (q_fin is None or q_fin.empty) and (a_fin is None or a_fin.empty):
-                return ticker, None  # 재무 데이터 자체가 없으면 스킵
-
-            return ticker, {
-                "q_fin": _safe_T(q_fin),
-                "q_bal": _safe_T(tk.quarterly_balance_sheet),
-                "q_cf":  _safe_T(tk.quarterly_cashflow),
-                "a_fin": _safe_T(a_fin),
-                "a_bal": _safe_T(tk.balance_sheet),
-                "a_cf":  _safe_T(tk.cashflow),
-                "info":  info,  # 위에서 받아둔 info 재사용
-            }
-
-        except Exception:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep((2 ** (attempt + 1)) + random.uniform(*SLEEP_JITTER))
-
-    return ticker, None
+def _fallback_sectors() -> list:
+    return sorted(["Information Technology","Health Care","Financials",
+                   "Consumer Discretionary","Consumer Staples","Energy",
+                   "Industrials","Materials","Real Estate","Utilities",
+                   "Communication Services"])
 
 
-# ─────────────────────────────────────────────
-# 재무 데이터 수집 (전체 티커)
-#  - submit + as_completed: 한 개 느려도 나머지 계속 처리
-#  - 개별/전체 타임아웃으로 무한 대기 방지
-#  - 1차 실패 티커 순차 재시도
-# ─────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_all_financial_source(tickers: list) -> dict:
-    data_cache: dict = {}
-    failed: list = []
+def download_price_data(tickers: tuple, start: str, end: str) -> dict:
+    """yfinance에서 OHLCV 데이터 일괄 다운로드."""
+    result = {}
+    batch = 10 if IS_CLOUD else 20   # 클라우드: 배치 크기 줄여 안정성 확보
+    tlist = list(tickers)
+    for i in range(0, len(tlist), batch):
+        chunk = tlist[i: i + batch]
+        for attempt in range(3):   # 최대 3회 재시도
+            try:
+                raw = yf.download(chunk, start=start, end=end,
+                                  auto_adjust=True, progress=False,
+                                  threads=(not IS_CLOUD))  # 클라우드: 단일 스레드
+                if raw.empty:
+                    break
+                if isinstance(raw.columns, pd.MultiIndex):
+                    for t in chunk:
+                        try:
+                            sub = raw.xs(t, axis=1, level=1).dropna(how="all")
+                            if len(sub) >= 60:
+                                result[t] = sub
+                        except Exception:
+                            pass
+                else:
+                    if len(chunk) == 1 and len(raw) >= 60:
+                        result[chunk[0]] = raw
+                break  # 성공 시 재시도 루프 탈출
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1.5 ** attempt)  # 0s, 1.5s 후 재시도
+        if CLOUD_DELAY and i + batch < len(tlist):
+            time.sleep(CLOUD_DELAY)   # 배치 간 딜레이
+    return result
 
-    progress_bar = st.progress(0, text="재무 데이터 수집 중...")
-    total = len(tickers)
 
-    # 1차: 병렬 수집
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_map = {executor.submit(_fetch_one_ticker, t): t for t in tickers}
-
-        done_count = 0
+@st.cache_data(ttl=7200, show_spinner=False)
+def get_fundamental_yf(tickers: tuple) -> dict:
+    """yfinance .info에서 펀더멘털 데이터 취득."""
+    out = {}
+    for t in tickers:
+        info = {}
+        for attempt in range(3):   # 최대 3회 재시도
+            try:
+                info = yf.Ticker(t).info or {}
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)  # 1s, 2s 후 재시도
         try:
-            for future in concurrent.futures.as_completed(future_map, timeout=300):
-                t = future_map[future]
-                try:
-                    ticker, result = future.result(timeout=45)
-                    if result:
-                        data_cache[ticker] = result
-                    else:
-                        failed.append(ticker)
-                except Exception:
-                    failed.append(t)
-
-                done_count += 1
-                progress_bar.progress(
-                    int(done_count / total * 80),
-                    text=f"재무 데이터 수집 중... ({done_count}/{total})"
-                )
-        except concurrent.futures.TimeoutError:
-            # 전체 타임아웃 시 미완료 티커를 failed에 추가
-            for f, t in future_map.items():
-                if not f.done():
-                    failed.append(t)
-                    f.cancel()
-
-    # 2차: 실패 티커 순차 재시도
-    if failed:
-        for idx, ticker in enumerate(failed):
-            progress_bar.progress(
-                int(80 + idx / max(len(failed), 1) * 18),
-                text=f"재시도 중... ({idx+1}/{len(failed)})"
-            )
-            time.sleep(random.uniform(*RETRY_SLEEP))
-            _, result = _fetch_one_ticker(ticker)
-            if result:
-                data_cache[ticker] = result
-
-    progress_bar.progress(100, text=f"완료: {len(data_cache)}/{total}개 수집")
-    time.sleep(0.5)
-    progress_bar.empty()
-
-    return data_cache
+            mkt  = info.get("marketCap", 0) or 0
+            out[t] = {
+                "pe":         info.get("trailingPE", np.nan),
+                "fwd_pe":     info.get("forwardPE", np.nan),
+                "pb":         info.get("priceToBook", np.nan),
+                "ps":         info.get("priceToSalesTrailing12Months", np.nan),
+                "ev_ebitda":  info.get("enterpriseToEbitda", np.nan),
+                "peg":        info.get("pegRatio", np.nan),
+                "div_yield":  (info.get("dividendYield") or 0),
+                "roe":        info.get("returnOnEquity", np.nan),
+                "roa":        info.get("returnOnAssets", np.nan),
+                "gross_mg":   info.get("grossMargins", np.nan),
+                "op_mg":      info.get("operatingMargins", np.nan),
+                "net_mg":     info.get("profitMargins", np.nan),
+                "rev_growth": info.get("revenueGrowth", np.nan),
+                "ni_growth":  info.get("earningsGrowth", np.nan),
+                "eps_growth": info.get("earningsQuarterlyGrowth", np.nan),
+                "debt_eq":    info.get("debtToEquity", np.nan),
+                "curr_ratio": info.get("currentRatio", np.nan),
+                "fcf":        info.get("freeCashflow", np.nan),
+                "revenue":    info.get("totalRevenue", np.nan),
+                "net_income": info.get("netIncomeToCommon", np.nan),
+                "total_debt": info.get("totalDebt", np.nan),
+                "total_cash": info.get("totalCash", np.nan),
+                "total_assets": info.get("totalAssets", np.nan),
+                "ebitda":     info.get("ebitda", np.nan),
+                "shares":     info.get("sharesOutstanding", np.nan),
+                "mkt_cap":    mkt,
+                "ev":         info.get("enterpriseValue", np.nan),
+                "interest_exp": info.get("interestExpense", np.nan),
+                "gross_profit": info.get("grossProfit", np.nan),
+                "ebit":       info.get("ebit", np.nan),
+            }
+        except Exception:
+            out[t] = {}
+        if CLOUD_DELAY:
+            time.sleep(CLOUD_DELAY)   # 종목 간 딜레이 (rate limit 방지)
+    return out
 
 
-# ─────────────────────────────────────────────
-# 안전한 Series 값 추출 헬퍼
-# ─────────────────────────────────────────────
-def _safe_get(series: pd.Series, key: str, default=0):
-    val = series.get(key, default)
-    if val is None:
-        return default
-    if isinstance(val, float) and np.isnan(val):
-        return default
-    return val
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_benchmark_prices(start: str, end: str) -> dict:
+    bm = {}
+    for tk in BENCHMARKS:
+        try:
+            df = yf.download(tk, start=start, end=end,
+                             auto_adjust=True, progress=False)
+            if not df.empty:
+                bm[tk] = df["Close"].squeeze()
+        except Exception:
+            pass
+    return bm
 
 
-# ─────────────────────────────────────────────
-# 재무 데이터 Point-in-Time 추출 헬퍼
-#  - 분기/연간 데이터 통합 후 기준일 기준 가장 가까운 행 선택
-#  - ffill/bfill로 NaN 보완
-# ─────────────────────────────────────────────
-def _get_pit_row(src: dict, q_key: str, a_key: str, ref_dt: pd.Timestamp) -> pd.Series:
-    """기준일(ref_dt) 기준 가장 가까운 재무 데이터 행을 반환."""
-    q_df = src.get(q_key, pd.DataFrame())
-    a_df = src.get(a_key, pd.DataFrame())
+# ═══════════════════════════════════════════════════════════
+# TECHNICAL INDICATOR CALCULATORS
+# ═══════════════════════════════════════════════════════════
 
-    if q_df.empty and a_df.empty:
-        return pd.Series(dtype=float)
-
-    combined = pd.concat([q_df, a_df]).sort_index(ascending=False)
-    combined = combined[~combined.index.duplicated(keep="first")]
-
-    # 기준일 + 45일 이내 데이터만 (미래 참조 방지 + 발표 지연 허용)
-    valid = combined[combined.index <= (ref_dt + pd.Timedelta(days=45))]
-    if valid.empty:
-        return pd.Series(dtype=float)
-
-    # 가장 가까운 시점 행 선택
-    idx_min = int(np.abs((valid.index - ref_dt).days).argmin())
-    row = valid.iloc[idx_min].copy()
-
-    # NaN이 많으면 ffill/bfill로 보완
-    if row.isna().sum() > len(row) * 0.5:
-        filled = combined.ffill().bfill()
-        if not filled.empty and idx_min < len(filled):
-            row = filled.iloc[idx_min]
-
-    return row
+def _rsi(close: pd.Series, n=14) -> pd.Series:
+    d = close.diff()
+    g = d.clip(lower=0).rolling(n).mean()
+    l = (-d.clip(upper=0)).rolling(n).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
 
 
-# ─────────────────────────────────────────────
-# 리밸런싱 메타 정보 수집
-#  - 백테스트 실제 기간 (hist 첫날 ~ 기준일)
-#  - 종목별 분기/연간 데이터 사용 여부
-# ─────────────────────────────────────────────
-def get_rebalance_meta(tickers, ref_date, full_hist_data, source_cache):
-    """
-    반환:
-        period_start : 백테스트에 사용된 주가 데이터 시작일
-        period_end   : 기준일 (= ref_date)
-        data_types   : {ticker: "분기" | "연간(분기 대체)" | "없음"}
-    """
-    ref_dt = pd.to_datetime(ref_date)
-    all_level0 = set(full_hist_data.columns.get_level_values(0))
+def _macd(close: pd.Series):
+    e12 = close.ewm(span=12, adjust=False).mean()
+    e26 = close.ewm(span=26, adjust=False).mean()
+    line = e12 - e26
+    sig  = line.ewm(span=9, adjust=False).mean()
+    return line - sig  # histogram
 
-    period_starts = []
-    data_types: dict = {}
 
-    for ticker in tickers:
-        if ticker not in all_level0:
-            continue
-        ticker_prices = full_hist_data[ticker].dropna(how="all")
-        hist = ticker_prices[ticker_prices.index < ref_dt].tail(252)
-        if len(hist) < 252:
-            continue
-        period_starts.append(hist.index[0])
+def _adx(high, low, close, n=14) -> pd.Series:
+    tr  = pd.concat([high-low,
+                     (high-close.shift()).abs(),
+                     (low -close.shift()).abs()], axis=1).max(axis=1)
+    dm_p = np.where((high-high.shift()) > (low.shift()-low),
+                    np.maximum(high-high.shift(), 0), 0)
+    dm_m = np.where((low.shift()-low) > (high-high.shift()),
+                    np.maximum(low.shift()-low, 0), 0)
+    atr   = tr.ewm(span=n, adjust=False).mean()
+    di_p  = 100 * pd.Series(dm_p, index=high.index).ewm(span=n, adjust=False).mean() / atr
+    di_m  = 100 * pd.Series(dm_m, index=high.index).ewm(span=n, adjust=False).mean() / atr
+    dx    = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, np.nan)
+    return dx.ewm(span=n, adjust=False).mean()
 
-        src   = source_cache.get(ticker, {})
-        q_fin = src.get("q_fin", pd.DataFrame())
-        a_fin = src.get("a_fin", pd.DataFrame())
 
-        # 기준일 기준으로 유효한 분기 데이터 존재 여부 확인
-        q_valid = q_fin[q_fin.index <= (ref_dt + pd.Timedelta(days=45))] if not q_fin.empty else pd.DataFrame()
-        a_valid = a_fin[a_fin.index <= (ref_dt + pd.Timedelta(days=45))] if not a_fin.empty else pd.DataFrame()
+def _stoch_k(high, low, close, n=14) -> pd.Series:
+    ll = low.rolling(n).min()
+    hh = high.rolling(n).max()
+    return 100 * (close - ll) / (hh - ll).replace(0, np.nan)
 
-        if not q_valid.empty:
-            data_types[ticker] = "분기"
-        elif not a_valid.empty:
-            data_types[ticker] = "연간(분기 대체)"
-        else:
-            data_types[ticker] = "없음"
 
-    period_start = min(period_starts).strftime("%Y-%m-%d") if period_starts else "N/A"
-    period_end   = ref_dt.strftime("%Y-%m-%d")
+def _cci(high, low, close, n=20) -> pd.Series:
+    tp  = (high + low + close) / 3
+    sma = tp.rolling(n).mean()
+    mad = tp.rolling(n).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+    return (tp - sma) / (0.015 * mad.replace(0, np.nan))
 
-    # 전체 요약: 분기/연간 비율
-    total = len(data_types)
-    q_count = sum(1 for v in data_types.values() if v == "분기")
-    a_count = sum(1 for v in data_types.values() if v == "연간(분기 대체)")
-    n_count = sum(1 for v in data_types.values() if v == "없음")
+
+def _williams_r(high, low, close, n=14) -> pd.Series:
+    hh = high.rolling(n).max()
+    ll = low.rolling(n).min()
+    return -100 * (hh - close) / (hh - ll).replace(0, np.nan)
+
+
+def _mfi(high, low, close, volume, n=14) -> pd.Series:
+    tp   = (high + low + close) / 3
+    rmf  = tp * volume
+    pos  = rmf.where(tp > tp.shift(1), 0.0)
+    neg  = rmf.where(tp < tp.shift(1), 0.0)
+    mfr  = pos.rolling(n).sum() / neg.rolling(n).sum().replace(0, np.nan)
+    return 100 - 100 / (1 + mfr)
+
+
+def calc_all_technical(ohlcv: pd.DataFrame) -> pd.DataFrame:
+    """단일 종목의 전체 기술지표 DataFrame 사전 계산 (전체 기간)."""
+    c, h, l, v = (ohlcv["Close"], ohlcv["High"],
+                  ohlcv["Low"],   ohlcv["Volume"])
+    logr = np.log(c / c.shift(1))
+
+    sma20  = c.rolling(20).mean()
+    sma50  = c.rolling(50).mean()
+    sma200 = c.rolling(200).mean()
+    std20  = c.rolling(20).std()
+    bb_up  = sma20 + 2 * std20
+    bb_lo  = sma20 - 2 * std20
+
+    tr  = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
+
+    macd_h = _macd(c)
+
+    df = pd.DataFrame(index=c.index)
+
+    # Momentum
+    df["Mom_1w"]  = c.pct_change(5)
+    df["Mom_1m"]  = c.pct_change(21)
+    df["Mom_3m"]  = c.pct_change(63)
+    df["Mom_6m"]  = c.pct_change(126)
+    df["Mom_12m"] = c.pct_change(252)
+    df["Mom_12_1"]       = df["Mom_12m"] - df["Mom_1m"]
+    df["Mom_6_1"]        = df["Mom_6m"]  - df["Mom_1m"]
+    df["Momentum_Custom"] = c.pct_change(63)
+
+    # Trend
+    df["RSI_14"]    = _rsi(c)
+    df["MACD_Hist"] = macd_h / c
+    df["Price_SMA20"]  = c / sma20  - 1
+    df["Price_SMA50"]  = c / sma50  - 1
+    df["Price_SMA200"] = c / sma200 - 1
+    df["SMA50_SMA200"] = sma50 / sma200 - 1
+    df["ADX_14"]       = _adx(h, l, c)
+    df["Stoch_K"]      = _stoch_k(h, l, c)
+    df["CCI_20"]       = _cci(h, l, c)
+    df["WilliamsR_14"] = _williams_r(h, l, c)
+    df["MFI_14"]       = _mfi(h, l, c, v)
+    df["BB_Width"]     = (bb_up - bb_lo) / sma20
+    df["BB_Pos"]       = (c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan)
+    df["High52w_Dist"] = c / c.rolling(252).max() - 1
+    df["Low52w_Dist"]  = c / c.rolling(252).min() - 1
+
+    # Risk / Volume
+    df["Volatility_30d"]   = logr.rolling(30).std()  * np.sqrt(252)
+    df["Volatility_90d"]   = logr.rolling(90).std()  * np.sqrt(252)
+    df["ATR_Ratio"]        = atr / c
+    vol_sma20 = v.rolling(20).mean()
+    df["Vol_Ratio"]        = v / vol_sma20.replace(0, np.nan)
+    df["Risk_Adj_Return"]  = logr.rolling(21).mean() / logr.rolling(21).std().replace(0, np.nan)
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════
+# FEATURE ENGINEERING
+# ═══════════════════════════════════════════════════════════
+
+def _fund_features(fund: dict, price: float) -> dict:
+    """yfinance info dict → 펀더멘털 피처."""
+    mkt  = fund.get("mkt_cap", np.nan) or np.nan
+    fcf  = fund.get("fcf",     np.nan) or np.nan
+    ev   = fund.get("ev",      np.nan) or np.nan
+    rev  = fund.get("revenue", np.nan) or np.nan
+    ni   = fund.get("net_income", np.nan) or np.nan
+    ta   = fund.get("total_assets", 1) or 1
+    eq   = max(fund.get("total_assets", 1) - (fund.get("total_debt", 0) or 0), 1)
+    ebit_val = fund.get("ebit", np.nan)
+    da       = 0
+    ebitda   = fund.get("ebitda", np.nan)
+    gp       = fund.get("gross_profit", np.nan)
+    iexp     = fund.get("interest_exp", np.nan)
+
+    p_fcf = mkt / fcf if (fcf and fcf > 0 and mkt and mkt > 0) else np.nan
+    fcf_yield = fcf / mkt if (mkt and mkt > 0 and fcf) else np.nan
+
+    ebitda_m = (ebitda / rev) if (rev and rev != 0 and ebitda is not None and not np.isnan(ebitda)) else np.nan
+
+    interest_cov = np.nan
+    if ebit_val is not None and not np.isnan(ebit_val) and iexp and iexp != 0:
+        interest_cov = ebit_val / abs(iexp)
+
+    gpa = gp / ta if (gp is not None and not np.isnan(gp)) else np.nan
+    at  = rev / ta if (rev is not None and not np.isnan(rev)) else np.nan
 
     return {
-        "period_start": period_start,
-        "period_end":   period_end,
-        "data_types":   data_types,
-        "q_count":  q_count,
-        "a_count":  a_count,
-        "n_count":  n_count,
-        "total":    total,
+        "P_E":               fund.get("pe", np.nan),
+        "P_B":               fund.get("pb", np.nan),
+        "P_S":               fund.get("ps", np.nan),
+        "EV_EBITDA":         fund.get("ev_ebitda", np.nan),
+        "P_FCF":             p_fcf,
+        "FCF_Yield":         fcf_yield,
+        "Div_Yield":         fund.get("div_yield", 0),
+        "PEG_Ratio":         fund.get("peg", np.nan),
+        "ROE":               fund.get("roe", np.nan),
+        "ROA":               fund.get("roa", np.nan),
+        "Gross_Margin":      fund.get("gross_mg", np.nan),
+        "Op_Margin":         fund.get("op_mg", np.nan),
+        "EBITDA_Margin":     ebitda_m,
+        "Rev_Growth":        fund.get("rev_growth", np.nan),
+        "NI_Growth":         fund.get("ni_growth", np.nan),
+        "EPS_Growth":        fund.get("eps_growth", np.nan),
+        "Debt_Equity":       fund.get("debt_eq", np.nan),
+        "Current_Ratio":     fund.get("curr_ratio", np.nan),
+        "Interest_Coverage": interest_cov,
+        "Asset_Turnover":    at,
+        "GP_A_Quality":      gpa,
+        "MktCap_Log":        np.log(fund.get("mkt_cap", 0) or 1),
     }
 
 
-# ─────────────────────────────────────────────
-# ML 피처 추출 (Point-in-Time)
-# ─────────────────────────────────────────────
-def fetch_ml_data_optimized_pit(
-    tickers, ref_date, full_hist_data, source_cache, is_training=True
-):
-    features_list = []
-    ref_dt = pd.to_datetime(ref_date)
-    all_level0 = set(full_hist_data.columns.get_level_values(0))
+def snapshot_at_date(
+    ticker: str,
+    tech_df: pd.DataFrame,
+    fund: dict,
+    date: pd.Timestamp,
+) -> dict | None:
+    """특정 날짜 기준 단일 종목 전체 피처 추출."""
+    mask = tech_df.index <= date
+    if mask.sum() == 0:
+        return None
+    row = tech_df[mask].iloc[-1]
 
-    for ticker in tickers:
-        try:
-            if ticker not in all_level0:
-                continue
+    features = {"ticker": ticker}
+    for col in FEAT_COLS:
+        if col in row.index:
+            features[col] = row[col]
+        else:
+            features[col] = np.nan
 
-            ticker_prices = full_hist_data[ticker].dropna(how="all")
-            hist = ticker_prices[ticker_prices.index < ref_dt].tail(252)
-            if len(hist) < 252:
-                continue
+    # 펀더멘털 (yfinance는 현재 값 사용 — Point-in-Time 근사)
+    fund_feat = _fund_features(fund, float(row.name) if isinstance(row.name, float) else np.nan)
+    for k, v in fund_feat.items():
+        features[k] = v
 
-            close_now = float(hist["Close"].iloc[-1])
-            src  = source_cache.get(ticker, {})
-            info = src.get("info", {})
+    return features
 
-            # ── Point-in-Time 재무 데이터 ──────────────────────────
-            cur  = _get_pit_row(src, "q_fin", "a_fin", ref_dt)
-            bal  = _get_pit_row(src, "q_bal", "a_bal", ref_dt)
-            cf   = _get_pit_row(src, "q_cf",  "a_cf",  ref_dt)
 
-            # 직전 분기 데이터 (성장률 계산용)
-            q_df = src.get("q_fin", pd.DataFrame())
-            a_df = src.get("a_fin", pd.DataFrame())
-            combined_fin = pd.concat([q_df, a_df]).sort_index(ascending=False)
-            combined_fin = combined_fin[~combined_fin.index.duplicated(keep="first")]
-            valid_fin    = combined_fin[combined_fin.index <= (ref_dt + pd.Timedelta(days=45))]
-            prev = valid_fin.iloc[1] if len(valid_fin) > 1 else cur
-            # ─────────────────────────────────────────────────────────
-
-            shares        = float(info.get("sharesOutstanding") or 1)
-            mkt_cap       = close_now * shares
-
-            net_income    = _safe_get(cur, "Net Income")
-            revenue       = _safe_get(cur, "Total Revenue")
-            gross_profit  = _safe_get(cur, "Gross Profit")
-            total_assets  = _safe_get(bal, "Total Assets",  1) or 1
-            fcf           = _safe_get(cf,  "Free Cash Flow")
-            ebit          = _safe_get(cur, "EBIT")
-            da            = _safe_get(cf,  "Depreciation And Amortization")
-            ebitda        = ebit + da
-            annual_ebitda = ebitda * 4
-            total_debt    = _safe_get(bal, "Total Debt")
-            cash_eq       = _safe_get(bal, "Cash And Cash Equivalents")
-            equity        = _safe_get(bal, "Stockholders Equity", 1) or 1
-            ev            = mkt_cap + total_debt - cash_eq
-
-            prev_revenue     = _safe_get(prev, "Total Revenue", 1) or 1
-            prev_net_income  = _safe_get(prev, "Net Income",    1) or 1
-
-            close = hist["Close"]
-
-            data = {
-                "Ticker":             ticker,
-                "P/E":                mkt_cap / (net_income * 4)    if net_income > 0    else 0,
-                "P/S":                mkt_cap / (revenue * 4)       if revenue > 0       else 0,
-                "P/B":                mkt_cap / equity,
-                "P/FCF":              mkt_cap / (fcf * 4)           if fcf > 0           else 0,
-                "EV/EBITDA":          ev / annual_ebitda             if annual_ebitda > 0 else 0,
-                "FCF_Yield":          (fcf * 4) / mkt_cap           if mkt_cap > 0       else 0,
-                "ROE":                net_income / equity,
-                "ROA":                net_income / total_assets,
-                "Gross_Margin":       gross_profit / revenue         if revenue > 0       else 0,
-                "Operating_Margin":   ebit / revenue                 if revenue > 0       else 0,
-                "EBITDA_Margin":      ebitda / revenue               if revenue > 0       else 0,
-                "GP_A_Quality":       gross_profit / total_assets,
-                "Asset_Turnover":     revenue / total_assets,
-                "Inventory_Turnover": (
-                    _safe_get(cur, "Cost Of Revenue") / (_safe_get(bal, "Inventory", 1) or 1)
-                    if "Inventory" in bal.index else 0
-                ),
-                "Revenue_Growth":     (revenue / prev_revenue) - 1,
-                "NetIncome_Growth":   (net_income / prev_net_income) - 1,
-                "Debt_Equity":        total_debt / equity,
-                "Current_Ratio":      (
-                    _safe_get(bal, "Total Current Assets")
-                    / (_safe_get(bal, "Total Current Liabilities", 1) or 1)
-                    if "Total Current Liabilities" in bal.index else 0
-                ),
-                "Interest_Coverage":  (
-                    ebit / (_safe_get(cur, "Interest Expense", 1) or 1)
-                    if "Interest Expense" in cur.index else 0
-                ),
-                "Mom_1w":             (close_now / close.iloc[-6])   - 1 if len(hist) >= 6   else 0,
-                "Mom_1m":             (close_now / close.iloc[-21])  - 1 if len(hist) >= 21  else 0,
-                "Mom_6m":             (close_now / close.iloc[-127]) - 1 if len(hist) >= 127 else 0,
-                "Mom_12m":            (close_now / close.iloc[-252]) - 1 if len(hist) >= 252 else 0,
-                "MA_Convergence": (
-                    (close.rolling(20).mean().iloc[-1] / close.rolling(200).mean().iloc[-1]) - 1
-                    if len(hist) >= 200 else 0
-                ),
-                "MA50_Dist":      close_now / close.rolling(50).mean().iloc[-1]  if len(hist) >= 50  else 1,
-                "MA200_Dist":     close_now / close.rolling(200).mean().iloc[-1] if len(hist) >= 200 else 1,
-                "Momentum_12M_1M":(close.iloc[-21] / close.iloc[-252]) - 1 if len(hist) >= 252 else 0,
-                "Momentum_6M_1M": (close.iloc[-21] / close.iloc[-126]) - 1 if len(hist) >= 126 else 0,
-                "Momentum_Custom":(close.iloc[-1]  / close.iloc[-63])  - 1 if len(hist) >= 63  else 0,
-                "Volatility_30d": close.pct_change().std() * np.sqrt(252),
-                "Risk_Adj_Return":(
-                    close.pct_change().mean() / close.pct_change().std()
-                    if close.pct_change().std() != 0 else 0
-                ),
-                "Vol_Change": (
-                    hist["Volume"].iloc[-1] / hist["Volume"].rolling(21).mean().iloc[-1]
-                    if len(hist) >= 21 else 1
-                ),
-            }
-
-            if is_training:
-                future_prices = ticker_prices[ticker_prices.index >= ref_dt].head(22)
-                if len(future_prices) >= 20:
-                    data["Target_Return"] = (
-                        future_prices["Close"].iloc[-1] / future_prices["Close"].iloc[0]
-                    ) - 1
-                else:
-                    continue
-
-            features_list.append(data)
-
-        except Exception:
+def build_snapshot_df(
+    tickers: list,
+    tech_map: dict,
+    fund_map: dict,
+    date: pd.Timestamp,
+    min_history: int = 252,
+) -> pd.DataFrame:
+    """모든 종목에 대해 특정 날짜의 피처 DataFrame 구성."""
+    rows = []
+    for t in tickers:
+        td = tech_map.get(t)
+        if td is None or len(td) < min_history:
             continue
+        feat = snapshot_at_date(t, td, fund_map.get(t, {}), date)
+        if feat:
+            rows.append(feat)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).set_index("ticker")
+    return df
 
-    return pd.DataFrame(features_list).replace([np.inf, -np.inf], np.nan).fillna(0)
 
+# ═══════════════════════════════════════════════════════════
+# FORWARD RETURN
+# ═══════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────
-# 지표 중요도 히트맵
-# ─────────────────────────────────────────────
-def display_importance_heatmap(imp_all_df):
-    st.subheader("🌡️ 지표별 영향력 타임라인 (Heatmap)")
-    if imp_all_df.empty:
-        st.write("데이터가 부족합니다.")
-        return
-    top_15 = imp_all_df.mean().nlargest(15).index.tolist()
-    heatmap_data = imp_all_df[top_15].T
+def forward_return(tech_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> float:
+    """start → end 기간의 실제 수익률."""
     try:
-        heatmap_data.columns = [pd.to_datetime(d).strftime("%Y-%m") for d in heatmap_data.columns]
+        close = tech_df["Close"] if "Close" in tech_df.columns else None
+        # tech_df here is original OHLCV, not indicator df
     except Exception:
-        heatmap_data.columns = [str(d)[:7] for d in heatmap_data.columns]
-    heatmap_norm = heatmap_data.apply(
-        lambda x: (x - x.min()) / (x.max() - x.min() + 1e-9), axis=0
-    )
-    fig, ax = plt.subplots(figsize=(12, 10))
-    sns.heatmap(
-        heatmap_norm, annot=heatmap_data.values, fmt=".2f",
-        cmap="YlGnBu", linewidths=0.5,
-        cbar_kws={"label": "Relative Importance"}, ax=ax,
-    )
-    plt.title("Feature Importance Heatmap (Top 15 Metrics)")
-    plt.xticks(rotation=45)
-    st.pyplot(fig)
+        return np.nan
+    return np.nan  # placeholder — actual call uses price_data dict
 
 
-# ─────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────
-st.title("🚀 Advanced AI Quant Lab")
-df_sp500, all_sectors = get_sp500_info()
-
-with st.expander("🛠 전략 설정 및 필터링", expanded=True):
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: selected_sectors = st.multiselect("1. 분석 섹터 선택", all_sectors, default=["Information Technology"])
-    with c2: start_date = st.date_input("2. 백테스트 시작일", datetime(2024, 1, 1))
-    with c3: end_date   = st.date_input("3. 백테스트 종료일", datetime.now())
-    with c4: reb_months = st.select_slider("4. 리밸런싱 주기 (개월)", options=[1, 3, 6, 12], value=3)
-    with c5: top_n      = st.number_input("5. 선정 종목 수", min_value=3, max_value=20, value=5)
-    run_analysis = st.button("백테스트 실행 🚀", use_container_width=True)
+def fwd_ret_from_price(price_data: dict, ticker: str,
+                       start: pd.Timestamp, end: pd.Timestamp) -> float:
+    try:
+        ohlcv = price_data[ticker]
+        s = ohlcv.loc[ohlcv.index >= start, "Close"].iloc[0]
+        e = ohlcv.loc[ohlcv.index >= end,   "Close"].iloc[0]
+        return e / s - 1
+    except Exception:
+        return np.nan
 
 
-# ─────────────────────────────────────────────
-# 백테스트 실행
-# ─────────────────────────────────────────────
-if run_analysis:
-    tickers = (
-        df_sp500[df_sp500["GICS Sector"].isin(selected_sectors)]["Symbol"]
-        .str.replace(".", "-", regex=False)
-        .tolist()
-    )
+# ═══════════════════════════════════════════════════════════
+# BACKTEST ENGINE
+# ═══════════════════════════════════════════════════════════
 
-    # 주가 데이터
-    st.info(f"📡 주가 데이터 다운로드 중... ({len(tickers)}개 티커)")
-    full_hist_data = yf.download(
-        tickers,
-        start=pd.to_datetime(start_date) - timedelta(days=400),
-        end=pd.to_datetime(end_date) + timedelta(days=40),
-        group_by="ticker",
-        progress=False,
-        threads=True,
-    )
-    st.success(f"✅ 주가 데이터 완료 ({full_hist_data.shape[1]}개 컬럼)")
+def add_months(dt: datetime, n: int) -> datetime:
+    month = dt.month - 1 + n
+    year  = dt.year + month // 12
+    month = month % 12 + 1
+    day   = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
 
-    # 재무 데이터
-    st.info("📊 재무 데이터 수집 중... (시간이 걸릴 수 있어요)")
-    source_cache = get_all_financial_source(tickers)
-    fin_count = len(source_cache)
-    st.success(f"✅ 재무 데이터 완료: {fin_count}/{len(tickers)}개")
 
-    # 재무 데이터가 너무 적으면 경고
-    if fin_count < len(tickers) * 0.5:
-        st.warning(
-            f"⚠️ 재무 데이터 수집률이 낮아요 ({fin_count}/{len(tickers)}). "
-            "Yahoo Finance 접속이 불안정할 수 있습니다. 잠시 후 다시 시도해보세요."
-        )
+def generate_rebalance_dates(start: datetime, end: datetime, months: int) -> list:
+    dates = []
+    cur = start
+    while cur <= end:
+        dates.append(pd.Timestamp(cur))
+        cur = add_months(cur, months)
+    return dates
 
-    date_range           = pd.date_range(start=start_date, end=end_date, freq=f"{reb_months}MS")
-    all_strategy_returns = pd.Series(dtype=float)
-    rebalance_details    = []
-    importance_history   = []
-    final_model_columns  = None
-    latest_model         = None
 
-    # ── 초기 모델 학습 ─────────────────────────────────────────
-    with st.status("🏗️ 초기 모델 학습 중...", expanded=True) as status:
-        train_df_init = fetch_ml_data_optimized_pit(
-            tickers, date_range[0], full_hist_data, source_cache, is_training=True
-        )
-        st.write(f"학습 데이터: {len(train_df_init)}개 종목")
+def run_backtest(
+    price_data:   dict,
+    fund_map:     dict,
+    tech_map:     dict,
+    rebal_dates:  list,
+    n_stocks:     int,
+    tc_pct:       float,
+    rolling_win:  int,
+    progress,
+) -> dict:
+    """메인 백테스트 엔진."""
+    n_dates = len(rebal_dates)
+    feature_cols = FEAT_COLS
 
-        # 재무 지표가 0인 비율 체크 (디버깅용)
-        if not train_df_init.empty:
-            fin_cols   = ["P/E", "P/S", "ROE", "ROA", "Gross_Margin"]
-            zero_ratio = (train_df_init[fin_cols] == 0).all(axis=1).mean()
-            if zero_ratio > 0.7:
-                st.warning(f"⚠️ {zero_ratio*100:.0f}%의 종목에서 재무 지표가 0입니다. 재무 데이터 수집을 확인하세요.")
-            else:
-                st.write(f"재무 지표 정상 비율: {(1-zero_ratio)*100:.0f}%")
+    # ── Step 1: 모든 리밸런싱 날짜의 스냅샷 + 실제 수익률 계산 ──
+    progress(0.05, "📊 지표 스냅샷 계산 중...")
+    snapshots: dict = {}  # date → pd.DataFrame (includes forward_return)
 
-        if not train_df_init.empty and "Target_Return" in train_df_init.columns:
-            X_init = train_df_init.drop(["Ticker", "Target_Return"], axis=1)
-            y_init = train_df_init["Target_Return"]
-            final_model_columns = X_init.columns.tolist()
-            latest_model = RandomForestRegressor(
-                n_estimators=100, random_state=42,
-                max_depth=10, min_samples_leaf=5, n_jobs=-1
-            )
-            latest_model.fit(X_init, y_init)
-            status.update(label=f"✅ 초기 학습 완료 ({date_range[0].strftime('%Y-%m-%d')})", state="complete")
-        else:
-            status.update(label="❌ 학습 데이터 없음", state="error")
-
-    if latest_model is None or final_model_columns is None:
-        st.error("초기 학습 데이터를 가져오지 못했습니다. 섹터나 기간을 조정해 주세요.")
-        st.stop()
-
-    # ── 워크포워드 루프 ─────────────────────────────────────────
-    loop_bar = st.progress(0, text="워크포워드 진행 중...")
-    total_steps = len(date_range) - 1
-
-    for i in range(total_steps):
-        curr_reb = date_range[i]
-        next_reb = date_range[i + 1]
-        loop_bar.progress(int(i / total_steps * 100), text=f"리밸런싱 {i+1}/{total_steps} ({curr_reb.strftime('%Y-%m')})")
-
-        inference_df = fetch_ml_data_optimized_pit(
-            tickers, curr_reb, full_hist_data, source_cache, is_training=False
-        )
-        if inference_df.empty:
+    for i, date in enumerate(rebal_dates[:-1]):
+        next_date = rebal_dates[i + 1]
+        tickers   = list(price_data.keys())
+        snap      = build_snapshot_df(tickers, tech_map, fund_map, date)
+        if snap.empty:
+            snapshots[date] = snap
             continue
 
-        X_test = (
-            inference_df.drop(["Ticker"], axis=1)
-            .reindex(columns=final_model_columns)
-            .fillna(0)
+        # 실제 forward return 추가
+        fwd = {t: fwd_ret_from_price(price_data, t, date, next_date)
+               for t in snap.index}
+        snap["_fwd_return"] = pd.Series(fwd)
+        snapshots[date] = snap
+        progress(0.05 + 0.25 * (i / max(n_dates - 2, 1)),
+                 f"스냅샷 계산 중 ({i+1}/{n_dates-1})...")
+
+    # ── Step 2: 롤링 모델 학습 + 포트폴리오 시뮬레이션 ──
+    progress(0.30, "🤖 AI 모델 학습 및 백테스트 실행 중...")
+
+    portfolio_dates  = [rebal_dates[0]]
+    portfolio_values = [1.0]
+    current_value    = 1.0
+
+    ic_records     = []
+    feat_imp_rows  = []
+    rebal_history  = []
+
+    imputer = SimpleImputer(strategy="median")
+
+    for i in range(rolling_win, n_dates - 1):
+        date      = rebal_dates[i]
+        next_date = rebal_dates[i + 1]
+
+        # ── 훈련 데이터 수집 ──────────────────────────────
+        X_list, y_list = [], []
+        for j in range(i - rolling_win, i):
+            snap = snapshots.get(rebal_dates[j])
+            if snap is None or snap.empty or "_fwd_return" not in snap.columns:
+                continue
+            cols = [c for c in feature_cols if c in snap.columns]
+            sub  = snap[cols + ["_fwd_return"]].dropna(subset=["_fwd_return"])
+            if len(sub) >= 5:
+                X_list.append(sub[cols])
+                y_list.append(sub["_fwd_return"])
+
+        if not X_list:
+            continue
+
+        X_train = pd.concat(X_list)
+        y_train = pd.concat(y_list)
+        avail_cols = X_train.columns.tolist()
+
+        X_imp = imputer.fit_transform(X_train)
+
+        model = RandomForestRegressor(
+            n_estimators=100, max_depth=5, min_samples_leaf=3,
+            random_state=42, n_jobs=1   # n_jobs=-1은 CPU수 따라 부동소수점 결과 달라짐
         )
-        inference_df = inference_df.copy()
-        inference_df["Prediction"] = latest_model.predict(X_test)
+        model.fit(X_imp, y_train)
 
-        selected_rows = inference_df.nlargest(top_n, "Prediction").copy()
-        sel_tickers   = selected_rows["Ticker"].tolist()
+        imp_dict = dict(zip(avail_cols, model.feature_importances_))
+        feat_imp_rows.append({"date": date, **imp_dict})
 
-        importances = pd.Series(latest_model.feature_importances_, index=final_model_columns)
-        importance_history.append({"Date": curr_reb.strftime("%Y-%m-%d"), **importances.to_dict()})
+        # ── 예측 ─────────────────────────────────────────
+        cur_snap = snapshots.get(date)
+        if cur_snap is None or cur_snap.empty:
+            continue
 
-        # 메타 정보 수집 (백테스트 기간 + 데이터 타입)
-        meta = get_rebalance_meta(tickers, curr_reb, full_hist_data, source_cache)
+        X_pred = cur_snap[[c for c in avail_cols if c in cur_snap.columns]].reindex(columns=avail_cols)
+        X_pred_imp = imputer.transform(X_pred)
+        pred_returns = model.predict(X_pred_imp)
+        pred_series  = pd.Series(pred_returns, index=cur_snap.index)
 
-        rebalance_details.append({
-            "date":         curr_reb.strftime("%Y-%m-%d"),
-            "next_date":    next_reb.strftime("%Y-%m-%d"),
-            "selected_data": selected_rows,
-            "importance":   importances,
-            "meta":         meta,
+        # ── IC 계산 ──────────────────────────────────────
+        actual = cur_snap["_fwd_return"].dropna()
+        common = pred_series.index.intersection(actual.index)
+        ic_val = np.nan
+        if len(common) >= 10:
+            ic_val, _ = spearmanr(pred_series[common], actual[common])
+            ic_records.append({"date": date, "IC": ic_val})
+
+        # ── 종목 선정 ─────────────────────────────────────
+        selected = pred_series.nlargest(n_stocks)
+
+        # ── 포트폴리오 수익률 ─────────────────────────────
+        port_ret = 0.0
+        valid_n  = 0
+        for t in selected.index:
+            r = fwd_ret_from_price(price_data, t, date, next_date)
+            if not np.isnan(r):
+                port_ret += r
+                valid_n  += 1
+        if valid_n > 0:
+            port_ret /= valid_n
+
+        # 거래비용 적용
+        tc = tc_pct / 100
+        current_value *= (1 + port_ret - tc)
+        portfolio_dates.append(next_date)
+        portfolio_values.append(current_value)
+
+        # ── 리밸런싱 히스토리 ─────────────────────────────
+        ticker_rows = []
+        for t in selected.index:
+            row_d = {"ticker": t, "예측수익률": pred_series[t],
+                     "실제수익률": actual.get(t, np.nan)}
+            for fc in feature_cols:
+                row_d[FEAT_NAMES.get(fc, fc)] = cur_snap.loc[t, fc] if fc in cur_snap.columns else np.nan
+            ticker_rows.append(row_d)
+
+        top10 = sorted(imp_dict.items(), key=lambda x: x[1], reverse=True)[:10]
+        rebal_history.append({
+            "rebalance_date":  date,
+            "next_date":       next_date,
+            "holding_period":  f"{date.strftime('%Y-%m-%d')} ~ {next_date.strftime('%Y-%m-%d')}",
+            "learn_start":     rebal_dates[i - rolling_win].strftime("%Y-%m-%d"),
+            "selected":        list(selected.index),
+            "ticker_df":       pd.DataFrame(ticker_rows),
+            "top10_features":  top10,
+            "port_return":     port_ret,
+            "ic":              ic_val,
         })
 
-        valid_sel = [t for t in sel_tickers if t in full_hist_data.columns.get_level_values(0)]
-        if valid_sel:
-            subset = full_hist_data[valid_sel].loc[curr_reb:next_reb]
-            if not subset.empty:
-                try:
-                    test_prices = subset.xs("Close", axis=1, level=1)
-                    period_rets = test_prices.pct_change().mean(axis=1).fillna(0)
-                    all_strategy_returns = pd.concat([all_strategy_returns, period_rets])
-                except Exception:
-                    pass
+        pct = 0.30 + 0.65 * (i - rolling_win) / max(n_dates - rolling_win - 1, 1)
+        progress(min(pct, 0.95), f"백테스트 진행 중 ({date.strftime('%Y-%m')})...")
 
-        train_df_next = fetch_ml_data_optimized_pit(
-            tickers, next_reb, full_hist_data, source_cache, is_training=True
-        )
-        if not train_df_next.empty and "Target_Return" in train_df_next.columns:
-            X_update = train_df_next.drop(["Ticker", "Target_Return"], axis=1)
-            y_update = train_df_next["Target_Return"]
-            latest_model.fit(X_update, y_update)
+    progress(0.98, "결과 정리 중...")
 
-    loop_bar.progress(100, text="워크포워드 완료!")
-
-    # ─────────────────────────────────────────────
-    # 결과 시각화
-    # ─────────────────────────────────────────────
-    if all_strategy_returns.empty:
-        st.warning("수익률 데이터를 생성하지 못했습니다.")
-        st.stop()
-
-    all_strategy_returns = (
-        all_strategy_returns[~all_strategy_returns.index.duplicated()].sort_index()
-    )
-    start_ts, end_ts = all_strategy_returns.index[0], all_strategy_returns.index[-1]
-
-    bench_raw = yf.download(
-        ["SPY", "QQQ", "TQQQ"],
-        start=start_ts - timedelta(days=5),
-        end=end_ts + timedelta(days=5),
-        progress=False,
-    )["Close"]
-    bench_raw = bench_raw.ffill().reindex(all_strategy_returns.index).ffill()
-
-    spy_rets  = bench_raw["SPY"].pct_change().fillna(0)
-    qqq_rets  = bench_raw["QQQ"].pct_change().fillna(0)
-    tqqq_rets = bench_raw["TQQQ"].pct_change().fillna(0)
-
-    st.header(f"📊 {', '.join(selected_sectors)} 전략 성과 보고서")
-
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.subheader("📈 누적 수익률 비교")
-        cum_returns = pd.DataFrame({
-            "Strategy (AI)": (1 + all_strategy_returns).cumprod(),
-            "SPY":   (1 + spy_rets).cumprod(),
-            "QQQ":   (1 + qqq_rets).cumprod(),
-            "TQQQ":  (1 + tqqq_rets).cumprod(),
-        })
-        fig_cum = px.line(
-            cum_returns, x=cum_returns.index, y=cum_returns.columns,
-            color_discrete_map={
-                "Strategy (AI)": "firebrick",
-                "SPY": "royalblue", "QQQ": "seagreen", "TQQQ": "orange",
-            },
-        )
-        fig_cum.update_layout(
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            height=500,
-        )
-        st.plotly_chart(fig_cum, use_container_width=True)
-
-    with col2:
-        st.subheader("💡 상세 성과 지표")
-
-        def get_metrics(rets):
-            cum = (1 + rets).prod() - 1
-            yrs = max((rets.index[-1] - rets.index[0]).days / 365.25, 0.1)
-            return {
-                "누적 수익률":    f"{cum * 100:.2f}%",
-                "연수익률(CAGR)": f"{((1 + cum) ** (1 / yrs) - 1) * 100:.2f}%",
-                "샤프 지수":      round(qs.stats.sharpe(rets), 2),
-                "MDD":            f"{qs.stats.max_drawdown(rets) * 100:.2f}%",
-            }
-
-        st.table(pd.DataFrame({
-            "AI Strategy": get_metrics(all_strategy_returns),
-            "SPY":  get_metrics(spy_rets),
-            "QQQ":  get_metrics(qqq_rets),
-            "TQQQ": get_metrics(tqqq_rets),
-        }))
-
-    st.divider()
-    st.subheader("🗓️ 리밸런싱 히스토리")
-
-    for detail in reversed(rebalance_details):
-        meta       = detail.get("meta", {})
-        check_cols = [c for c in ["P/E", "ROE"] if c in detail["selected_data"].columns]
-        has_fin    = (
-            not (detail["selected_data"][check_cols].abs() < 0.0001).all().all()
-            if check_cols else False
-        )
-
-        # ── 분기/연간 비율 계산 ──────────────────────────────────
-        q_count = meta.get("q_count", 0)
-        a_count = meta.get("a_count", 0)
-        n_count = meta.get("n_count", 0)
-        total   = meta.get("total",   1) or 1
-
-        if q_count / total >= 0.7:
-            data_badge = "🟢 분기 데이터"
-        elif a_count / total >= 0.5:
-            data_badge = "🟡 연간(분기 대체)"
-        else:
-            data_badge = "🔴 데이터 부족"
-
-        fin_badge     = "✅ 재무+가격" if has_fin else "⚠️ 모멘텀 중심"
-        period_start  = meta.get("period_start", "N/A")
-        period_end    = meta.get("period_end",   detail["date"])
-        next_date     = detail.get("next_date",  "N/A")
-
-        expander_label = (
-            f"📅 {detail['date']}  |  {fin_badge}  |  {data_badge}"
-        )
-
-        with st.expander(expander_label, expanded=False):
-
-            # ── 상단 메타 정보 배지 행 ───────────────────────────
-            m1, m2, m3, m4 = st.columns(4)
-            m1.markdown(f"📆 **리밸런싱 기준일**<br>{detail['date']}", unsafe_allow_html=True)
-            m2.markdown(f"📈 **보유 기간**<br>{period_end} ~ {next_date}", unsafe_allow_html=True)
-            m3.markdown(f"📊 **주가 학습 기간**<br>{period_start} ~ {period_end}", unsafe_allow_html=True)
-            m4.markdown(f"🗃️ **재무 데이터**<br>분기 {q_count}개 / 연간 {a_count}개 / 없음 {n_count}개", unsafe_allow_html=True)
-
-            st.divider()
-
-            # ── 종목별 데이터 타입 태그 ──────────────────────────
-            data_types = meta.get("data_types", {})
-            sel_tickers_in_detail = detail["selected_data"]["Ticker"].tolist() if "Ticker" in detail["selected_data"].columns else []
-            if data_types and sel_tickers_in_detail:
-                tag_parts = []
-                for t in sel_tickers_in_detail:
-                    dtype = data_types.get(t, "없음")
-                    icon  = "🟢" if dtype == "분기" else ("🟡" if dtype == "연간(분기 대체)" else "🔴")
-                    tag_parts.append(f"{icon} **{t}** ({dtype})")
-                st.markdown("**선정 종목 데이터 타입:**  " + "  ·  ".join(tag_parts))
-                st.divider()
-
-            # ── 선정 종목 테이블 + 중요도 차트 ──────────────────
-            d1, d2 = st.columns([3, 2])
-            with d1:
-                st.markdown("**선정 종목 상세**")
-                st.dataframe(
-                    detail["selected_data"].drop(
-                        columns=["Target_Return", "Prediction"], errors="ignore"
-                    ),
-                    use_container_width=True, hide_index=True,
-                )
-            with d2:
-                st.markdown("**지표 중요도 (Top 10)**")
-                imp_df = detail["importance"].nlargest(10).reset_index()
-                imp_df.columns = ["지표", "중요도"]
-                fig_imp = px.bar(
-                    imp_df, x="중요도", y="지표", orientation="h",
-                    color="중요도", color_continuous_scale="Greens", height=300,
-                )
-                fig_imp.update_layout(yaxis={"categoryorder": "total ascending"}, showlegend=False)
-                st.plotly_chart(fig_imp, use_container_width=True, key=f"imp_{detail['date']}")
-
-    st.subheader("🧠 지표 중요도 트렌드")
-    imp_all_df = pd.DataFrame(importance_history).set_index("Date").fillna(0)
-    top5 = imp_all_df.mean().nlargest(5).index.tolist()
-    st.line_chart(imp_all_df[top5])
-
-    imp_norm     = imp_all_df.div(imp_all_df.sum(axis=1), axis=0).fillna(0) * 100
-    top7         = imp_norm.mean().nlargest(7).index.tolist()
-    display_norm = imp_norm[top7].reset_index()
-    fig_area = px.area(
-        display_norm, x="Date", y=top7,
-        title="주요 지표 영향력 비중 추이 (Top 7)",
-        labels={"value": "중요도 비중 (%)", "Date": "리밸런싱 시점", "variable": "지표"},
-        color_discrete_sequence=px.colors.qualitative.Pastel,
-    )
-    fig_area.update_layout(
-        hovermode="x unified", legend_orientation="h",
-        legend_y=-0.2, yaxis_range=[0, 100],
-    )
-    st.plotly_chart(fig_area, use_container_width=True)
-    display_importance_heatmap(imp_all_df)
-
-    st.divider()
-    st.subheader(f"🎯 실시간 AI 추천 종목 (Next {reb_months}M)")
-    latest_data = fetch_ml_data_optimized_pit(
-        tickers, datetime.now(), full_hist_data, source_cache, is_training=False
-    )
-    recommend_all = pd.DataFrame()
-    display_cols  = []
-    if not latest_data.empty:
-        X_latest = (
-            latest_data.drop(["Ticker"], axis=1, errors="ignore")
-            .reindex(columns=final_model_columns).fillna(0)
-        )
-        latest_data = latest_data.copy()
-        latest_data["AI_Score"] = latest_model.predict(X_latest)
-        recommend_all = latest_data.sort_values("AI_Score", ascending=False)
-        display_cols  = ["Ticker", "AI_Score"] + [
-            c for c in final_model_columns if c in recommend_all.columns
-        ]
-        st.dataframe(
-            recommend_all[display_cols]
-            .style.background_gradient(subset=["AI_Score"], cmap="YlGn")
-            .format(precision=3),
-            use_container_width=True, hide_index=True,
-        )
+    # ── feat_imp_history DataFrame ────────────────────────
+    if feat_imp_rows:
+        fimp_df = pd.DataFrame(feat_imp_rows).set_index("date")
+        fimp_df.index = pd.to_datetime(fimp_df.index)
     else:
-        st.warning("실시간 추천 데이터를 생성할 수 없습니다.")
+        fimp_df = pd.DataFrame()
 
-    st.divider()
-    st.subheader("📥 분석 결과 내보내기")
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            "📈 누적 수익률 (CSV)",
-            data=cum_returns.to_csv().encode("utf-8-sig"),
-            file_name=f"returns_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv", use_container_width=True,
+    ic_df = pd.DataFrame(ic_records) if ic_records else pd.DataFrame()
+
+    return {
+        "port_dates":   portfolio_dates,
+        "port_values":  portfolio_values,
+        "ic_df":        ic_df,
+        "fimp_df":      fimp_df,
+        "rebal_hist":   rebal_history,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# PERFORMANCE METRICS
+# ═══════════════════════════════════════════════════════════
+
+def build_daily_portfolio(results: dict, price_data: dict) -> pd.Series:
+    """리밸런싱 히스토리 + 일별 가격으로 AI 포트폴리오 일단위 시계열 구성."""
+    hist       = results.get("rebal_hist", [])
+    port_dates = [pd.Timestamp(d) for d in results["port_dates"]]
+    port_vals  = results["port_values"]
+
+    # 히스토리나 가격 데이터 없으면 기간 단위 그대로 반환
+    if not hist or not price_data:
+        return pd.Series(port_vals, index=pd.DatetimeIndex(port_dates))
+
+    records: dict = {}
+    cur_val = 1.0
+
+    # ① warm-up 구간 (학습 기간): 첫 운용 시작일 전까지 1.0으로 평탄
+    init_date   = port_dates[0]
+    first_trade = hist[0]["rebalance_date"]
+    for d in pd.bdate_range(init_date, first_trade):
+        records[d] = 1.0
+
+    # ② 리밸런싱별 일단위 포트폴리오 계산
+    for h in hist:
+        s_dt    = h["rebalance_date"]
+        e_dt    = h["next_date"]
+        tickers = h["selected"]
+
+        price_dict = {}
+        for t in tickers:
+            if t not in price_data:
+                continue
+            ohlcv = price_data[t]
+            mask  = (ohlcv.index >= s_dt) & (ohlcv.index <= e_dt)
+            sub   = ohlcv.loc[mask, "Close"].dropna()
+            if len(sub) >= 2:
+                price_dict[t] = sub / float(sub.iloc[0])  # 기간 시작 기준 정규화
+
+        if not price_dict:
+            records[e_dt] = cur_val * (1 + h["port_return"])
+            cur_val = records[e_dt]
+            continue
+
+        # 동일 가중 지수 × 현재 포트폴리오 가치
+        pf_df  = pd.DataFrame(price_dict).dropna(how="all")
+        eq_idx = pf_df.mean(axis=1)
+        for dt, v in eq_idx.items():
+            if dt >= s_dt:
+                records[dt] = float(v) * cur_val
+
+        cur_val = float(eq_idx.iloc[-1]) * cur_val
+
+    if not records:
+        return pd.Series(port_vals, index=pd.DatetimeIndex(port_dates))
+
+    return pd.Series(records).sort_index()
+
+
+def calc_metrics(series: pd.Series, label: str) -> dict:
+    if len(series) < 2:
+        return {"지표": label}
+    r  = series.pct_change().dropna()
+    yr = (series.index[-1] - series.index[0]).days / 365.25
+    total = series.iloc[-1] / series.iloc[0] - 1
+    cagr  = (series.iloc[-1] / series.iloc[0]) ** (1 / max(yr, 0.01)) - 1
+    vol   = r.std() * np.sqrt(252)
+    sharpe = (cagr - 0.02) / vol if vol > 0 else 0
+    neg_r  = r[r < 0]
+    sortino = (cagr - 0.02) / (neg_r.std() * np.sqrt(252)) if len(neg_r) > 1 else 0
+    dd = (series / series.cummax() - 1)
+    mdd    = dd.min()
+    calmar = cagr / abs(mdd) if mdd != 0 else 0
+    monthly = series.resample("ME").last().pct_change().dropna()
+    win_rate = (monthly > 0).mean() if len(monthly) > 0 else 0
+    return {
+        "전략":     label,
+        "총수익률": f"{total:.1%}",
+        "CAGR":     f"{cagr:.1%}",
+        "연변동성": f"{vol:.1%}",
+        "Sharpe":   f"{sharpe:.2f}",
+        "Sortino":  f"{sortino:.2f}",
+        "Max DD":   f"{mdd:.1%}",
+        "Calmar":   f"{calmar:.2f}",
+        "월승률":   f"{win_rate:.1%}",
+    }
+
+
+def norm_series(s: pd.Series, ref: pd.Timestamp) -> pd.Series:
+    s = s.dropna()
+    idx = s.index[s.index >= ref]
+    if not len(idx):
+        return s
+    return s[idx] / s[idx[0]]
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 1 ── 성과 비교
+# ═══════════════════════════════════════════════════════════
+
+def tab_performance(results: dict, benchmarks: dict, price_data: dict):
+    pd_ = results["port_dates"]
+    pv_ = results["port_values"]
+
+    if len(pd_) < 2:
+        st.warning("백테스트 기간이 짧아 성과 데이터가 부족합니다.")
+        return
+
+    # 성과 지표 계산은 기간 단위 시리즈 사용 (정확한 TC 반영)
+    port_period = pd.Series(pv_, index=pd.DatetimeIndex(pd_))
+    start       = port_period.index[0]
+    metrics_all = [calc_metrics(port_period, "🤖 AI 전략")]
+
+    # 차트용: 일단위 시리즈 (벤치마크와 동일 빈도)
+    port_daily = build_daily_portfolio(results, price_data)
+
+    col_chart, col_metrics = st.columns([7, 3])
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=port_daily.index, y=port_daily.values,
+        name="🤖 AI 전략",
+        line=dict(color="#7c4dff", width=3),
+        hovertemplate="%{x|%Y-%m-%d}<br>%{y:.3f}<extra>AI 전략</extra>",
+    ))
+
+    colors = {"SPY": "#ff6b35", "QQQ": "#00c9a7", "TQQQ": "#ffd700"}
+    for tk, label in BENCHMARKS.items():
+        if tk in benchmarks:
+            ns = norm_series(benchmarks[tk], start)
+            if len(ns) > 1:
+                fig.add_trace(go.Scatter(
+                    x=ns.index, y=ns.values, name=label,
+                    line=dict(color=colors.get(tk, "#888"), width=2),
+                    hovertemplate=f"%{{x|%Y-%m-%d}}<br>%{{y:.3f}}<extra>{label}</extra>",
+                ))
+                metrics_all.append(calc_metrics(ns, label))
+
+    fig.update_layout(
+        **PLOT_CFG, height=420,
+        title="포트폴리오 누적 수익률 비교",
+        xaxis_title="날짜", yaxis_title="누적 수익 (1.0 = 시작)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.08)")
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
+
+    with col_chart:
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_metrics:
+        st.markdown('<div class="section-hdr">📈 성과 지표 비교</div>', unsafe_allow_html=True)
+        mdf = pd.DataFrame(metrics_all).set_index("전략").T
+        st.dataframe(mdf, use_container_width=True, height=300)
+
+        ai = metrics_all[0]
+        st.markdown("---")
+        c1, c2, c3 = st.columns(3)
+        cagr_n = float(ai["CAGR"].strip("%"))
+        mdd_n  = float(ai["Max DD"].strip("%"))
+        c1.markdown(f"""<div class="metric-box">
+            <div class="metric-label">CAGR</div>
+            <div class="metric-value {'pos' if cagr_n > 0 else 'neg'}">{ai['CAGR']}</div>
+        </div>""", unsafe_allow_html=True)
+        c2.markdown(f"""<div class="metric-box">
+            <div class="metric-label">Sharpe</div>
+            <div class="metric-value neu">{ai['Sharpe']}</div>
+        </div>""", unsafe_allow_html=True)
+        c3.markdown(f"""<div class="metric-box">
+            <div class="metric-label">Max DD</div>
+            <div class="metric-value neg">{ai['Max DD']}</div>
+        </div>""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 2 ── IC 분석
+# ═══════════════════════════════════════════════════════════
+
+def tab_ic(results: dict):
+    # ── IC 분석 개념 설명 ──────────────────────────────────
+    with st.expander("📖 IC 분석이란?", expanded=False):
+        st.markdown("""
+**IC (Information Coefficient, 정보 계수)**는 AI 모델의 예측력을 평가하는 핵심 지표입니다.
+
+| 지표 | 정의 | 기준 |
+|------|------|------|
+| **IC** | AI 예측 수익률 순위와 실제 수익률 순위 간의 **Spearman 상관계수** | > 0.05 = 좋음, > 0 = 유효 |
+| **IC IR** | IC 평균 ÷ IC 표준편차 (예측 일관성) | > 0.5 = 우수, > 0.3 = 양호 |
+| **양(+)IC 비율** | IC > 0인 리밸런싱 기간 비율 | > 60% = 안정적 |
+
+**해석 방법**
+- IC가 꾸준히 **양수(+)**이면 AI 모델이 상승 종목을 잘 예측함을 의미합니다.
+- IC = 0이면 예측력 없음, IC < 0이면 역방향 예측 (위험 신호).
+- 누적 IC가 **우상향** 추세이면 모델 품질이 일관적으로 유지되고 있습니다.
+- 학술적으로 IC > 0.05이면 실용적으로 유의미한 예측력으로 간주합니다.
+        """)
+
+    ic_df = results.get("ic_df", pd.DataFrame())
+    if ic_df.empty:
+        st.info("IC 데이터가 부족합니다. 백테스트 기간을 늘려주세요.")
+        return
+
+    ic_df = ic_df.copy()
+    ic_df["date"] = pd.to_datetime(ic_df["date"])
+    ic_df = ic_df.sort_values("date")
+
+    ic_mean = ic_df["IC"].mean()
+    ic_std  = ic_df["IC"].std()
+    ic_ir   = ic_mean / ic_std if ic_std > 0 else 0
+    pos_rate = (ic_df["IC"] > 0).mean()
+
+    def _mcol(v): return "pos" if v > 0.03 else ("neg" if v < 0 else "neu")
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, lbl, val in [
+        (c1, "평균 IC",    ic_mean),
+        (c2, "IC IR",     ic_ir),
+        (c3, "IC 표준편차", ic_std),
+        (c4, "양(+)IC 비율", pos_rate),
+    ]:
+        col.markdown(f"""<div class="metric-box">
+            <div class="metric-label">{lbl}</div>
+            <div class="metric-value {_mcol(val)}">{val:.3f}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # IC 막대 + 누적 IC
+    colors = ["#00c853" if x > 0 else "#ff1744" for x in ic_df["IC"]]
+    fig1 = go.Figure()
+    fig1.add_trace(go.Bar(
+        x=ic_df["date"], y=ic_df["IC"], marker_color=colors,
+        hovertemplate="%{x|%Y-%m}<br>IC: %{y:.4f}<extra></extra>",
+    ))
+    fig1.add_hline(y=0, line_color="white", opacity=0.4, line_width=1)
+    fig1.add_hline(y=ic_mean, line_dash="dash", line_color="#7c4dff", line_width=2,
+                   annotation_text=f"평균 {ic_mean:.3f}", annotation_position="top right")
+    fig1.update_layout(**PLOT_CFG, height=280, title="리밸런싱별 IC")
+    fig1.update_xaxes(gridcolor="rgba(255,255,255,0.08)")
+    fig1.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
+
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(
+        x=ic_df["date"], y=ic_df["IC"].cumsum(),
+        fill="tozeroy", line=dict(color="#00c9a7", width=2),
+        fillcolor="rgba(0,201,167,0.15)",
+        hovertemplate="%{x|%Y-%m}<br>누적 IC: %{y:.3f}<extra></extra>",
+    ))
+    fig2.update_layout(**PLOT_CFG, height=280, title="누적 IC")
+    fig2.update_xaxes(gridcolor="rgba(255,255,255,0.08)")
+    fig2.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.plotly_chart(fig1, use_container_width=True)
+    with col_b:
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # IC 분포 히스토그램
+    fig3 = go.Figure()
+    fig3.add_trace(go.Histogram(
+        x=ic_df["IC"], nbinsx=20, marker_color="#7c4dff", opacity=0.8,
+    ))
+    fig3.add_vline(x=0, line_dash="dash", line_color="white", opacity=0.5)
+    fig3.add_vline(x=ic_mean, line_dash="dash", line_color="#00c9a7",
+                   annotation_text=f"평균: {ic_mean:.3f}")
+    fig3.update_layout(**PLOT_CFG, height=240, title="IC 분포 히스토그램")
+    st.plotly_chart(fig3, use_container_width=True)
+
+    # IC 테이블
+    st.markdown('<div class="section-hdr">📋 리밸런싱별 IC 상세</div>', unsafe_allow_html=True)
+    disp = ic_df.copy()
+    disp["date"] = disp["date"].dt.strftime("%Y-%m-%d")
+    disp["IC"]   = disp["IC"].round(4)
+    disp["평가"] = disp["IC"].apply(
+        lambda x: "✅ 좋음(>0.05)" if x > 0.05 else ("⚠️ 보통(>0)" if x > 0 else "❌ 음수"))
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 3 ── 리밸런싱 히스토리
+# ═══════════════════════════════════════════════════════════
+
+def tab_history(results: dict):
+    hist = results.get("rebal_hist", [])
+    if not hist:
+        st.info("리밸런싱 히스토리가 없습니다.")
+        return
+
+    st.markdown(f"총 **{len(hist)}**회 리밸런싱 수행됨")
+
+    opts = [f"{h['rebalance_date'].strftime('%Y-%m-%d')} → {h['next_date'].strftime('%Y-%m-%d')}"
+            for h in hist]
+
+    # session_state로 인덱스 관리 → 탭이 0으로 리셋되는 버그 방지
+    if "hist_sel_idx" not in st.session_state or st.session_state.hist_sel_idx >= len(opts):
+        st.session_state.hist_sel_idx = len(opts) - 1
+
+    sel = st.selectbox(
+        "리밸런싱 기간 선택",
+        opts,
+        index=st.session_state.hist_sel_idx,
+        key="hist_period_select",
+    )
+    st.session_state.hist_sel_idx = opts.index(sel)
+    h = hist[opts.index(sel)]
+
+    ret_c = "pos" if h["port_return"] > 0 else "neg"
+    ic_v  = h["ic"]
+    ic_c  = "pos" if (not np.isnan(ic_v) and ic_v > 0) else "neg"
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    for col, lbl, val, clr in [
+        (c1, "리밸런싱 기준일", h["rebalance_date"].strftime("%Y-%m-%d"), "neu"),
+        (c2, "보유 기간",       h["holding_period"], "neu"),
+        (c3, "주가 학습 기간",  f"{h['learn_start']} ~", "neu"),
+        (c4, "기간 수익률",     f"{h['port_return']:.2%}", ret_c),
+        (c5, "IC",             f"{ic_v:.3f}" if not np.isnan(ic_v) else "N/A", ic_c),
+    ]:
+        col.markdown(f"""<div class="metric-box">
+            <div class="metric-label">{lbl}</div>
+            <div class="metric-value {clr}" style="font-size:0.95rem">{val}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    col_l, col_r = st.columns([6, 4])
+
+    with col_l:
+        st.markdown('<div class="section-hdr">📋 선정 종목 상세 지표</div>', unsafe_allow_html=True)
+        tdf = h.get("ticker_df", pd.DataFrame())
+        if not tdf.empty:
+            # 핵심 컬럼 우선 표시
+            priority = ["ticker", "예측수익률", "실제수익률",
+                        "1개월 수익률", "3개월 수익률", "6개월 수익률",
+                        "RSI(14)", "P/E 비율", "P/B 비율", "ROE", "영업이익률"]
+            disp_cols = [c for c in priority if c in tdf.columns]
+            remaining = [c for c in tdf.columns if c not in disp_cols]
+            disp = tdf[disp_cols + remaining].copy()
+            # 수익률 포맷
+            for c in disp.columns:
+                if "수익률" in c or c in ["ROE", "ROA", "매출총이익률", "영업이익률"]:
+                    disp[c] = disp[c].apply(lambda x: f"{x:.2%}" if pd.notna(x) and isinstance(x, float) else x)
+                elif c in ["P/E 비율", "P/B 비율", "EV/EBITDA", "ADX(14)", "RSI(14)"]:
+                    disp[c] = disp[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) and isinstance(x, float) else x)
+            st.dataframe(disp, use_container_width=True, hide_index=True, height=360,
+                         key="hist_ticker_df")
+
+    with col_r:
+        st.markdown('<div class="section-hdr">🏆 지표 중요도 TOP 10</div>', unsafe_allow_html=True)
+        top10 = h.get("top10_features", [])
+        if top10:
+            names = [FEAT_NAMES.get(f, f) for f, _ in top10]
+            vals  = [v for _, v in top10]
+            fig = go.Figure(go.Bar(
+                x=vals[::-1], y=names[::-1], orientation="h",
+                marker=dict(color=vals[::-1], colorscale="Viridis"),
+                hovertemplate="%{y}<br>중요도: %{x:.4f}<extra></extra>",
+            ))
+            fig.update_layout(
+                **PLOT_CFG, height=360,
+                margin=dict(l=130, r=10, t=10, b=30),
+                xaxis_title="중요도",
+            )
+            fig.update_yaxes(tickfont=dict(size=10))
+            st.plotly_chart(fig, use_container_width=True, key="hist_top10_chart")
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 4 ── 지표 중요도
+# ═══════════════════════════════════════════════════════════
+
+def tab_importance(results: dict):
+    fimp = results.get("fimp_df", pd.DataFrame())
+    if fimp.empty:
+        st.info("지표 중요도 데이터가 없습니다.")
+        return
+
+    avg_imp = fimp.mean().sort_values(ascending=False)
+    top_n   = st.slider("표시할 지표 수", 5, min(25, len(fimp.columns)), 10, key="importance_top_n")
+    top_f   = avg_imp.head(top_n).index.tolist()
+
+    palette = px.colors.qualitative.Plotly
+
+    # 중요도 추이 라인 그래프
+    st.markdown('<div class="section-hdr">📈 주요 지표 중요도 추이 (리밸런싱별)</div>',
+                unsafe_allow_html=True)
+    fig1 = go.Figure()
+    for i, f in enumerate(top_f):
+        if f in fimp.columns:
+            fig1.add_trace(go.Scatter(
+                x=fimp.index, y=fimp[f],
+                name=FEAT_NAMES.get(f, f),
+                line=dict(color=palette[i % len(palette)], width=2),
+                hovertemplate=f"{FEAT_NAMES.get(f,f)}<br>%{{x|%Y-%m}}: %{{y:.4f}}<extra></extra>",
+            ))
+    fig1.update_layout(
+        **PLOT_CFG, height=380,
+        xaxis_title="날짜", yaxis_title="중요도",
+        hovermode="x unified",
+        legend=dict(x=1.01, y=1),
+    )
+    fig1.update_xaxes(gridcolor="rgba(255,255,255,0.08)")
+    fig1.update_yaxes(gridcolor="rgba(255,255,255,0.08)")
+    st.plotly_chart(fig1, use_container_width=True)
+
+    # 지표 중요도 비중 누적 영역 그래프
+    st.markdown('<div class="section-hdr">📊 지표 중요도 비중 추이 (누적 스택)</div>',
+                unsafe_allow_html=True)
+    prop = fimp[top_f].div(fimp[top_f].sum(axis=1), axis=0)
+    fig2 = go.Figure()
+    for i, f in enumerate(top_f):
+        if f in prop.columns:
+            fig2.add_trace(go.Scatter(
+                x=prop.index, y=prop[f],
+                name=FEAT_NAMES.get(f, f),
+                stackgroup="one",
+                line=dict(color=palette[i % len(palette)], width=1),
+                hovertemplate=f"{FEAT_NAMES.get(f,f)}: %{{y:.1%}}<extra></extra>",
+            ))
+    fig2.update_layout(
+        **PLOT_CFG, height=320,
+        yaxis=dict(tickformat=".0%"),
+        hovermode="x unified",
+        legend=dict(x=1.01, y=1),
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # 최근 중요도 순위 테이블
+    st.markdown('<div class="section-hdr">📋 최근 지표 중요도 순위</div>', unsafe_allow_html=True)
+    latest = fimp.iloc[-1].sort_values(ascending=False)
+    tbl = pd.DataFrame({
+        "순위":   range(1, len(latest) + 1),
+        "지표":   [FEAT_NAMES.get(k, k) for k in latest.index],
+        "그룹":   [FEATURE_META.get(k, {}).get("group", "") for k in latest.index],
+        "중요도": latest.values.round(4),
+        "비중":   (latest / latest.sum()).apply(lambda x: f"{x:.1%}"),
+    }).head(20)
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 5 ── 영향력 히트맵
+# ═══════════════════════════════════════════════════════════
+
+def tab_heatmap(results: dict):
+    fimp = results.get("fimp_df", pd.DataFrame())
+    if fimp.empty:
+        st.info("히트맵 데이터가 없습니다.")
+        return
+
+    st.markdown('<div class="section-hdr">🗺️ 지표 영향력 타임라인 히트맵</div>',
+                unsafe_allow_html=True)
+
+    n_feats = st.slider("표시할 지표 수", 5, min(len(fimp.columns), 50),
+                        min(30, len(fimp.columns)), key="heatmap_n_feats")
+    avg_imp = fimp.mean().sort_values(ascending=False)
+    top_f   = avg_imp.head(n_feats).index.tolist()
+
+    heat = fimp[top_f].T
+    ylbls = [FEAT_NAMES.get(f, f) for f in heat.index]
+    xlbls = [d.strftime("%Y-%m") for d in heat.columns]
+
+    fig = go.Figure(go.Heatmap(
+        z=heat.values, x=xlbls, y=ylbls,
+        colorscale="RdYlBu_r",
+        hovertemplate="날짜: %{x}<br>지표: %{y}<br>중요도: %{z:.4f}<extra></extra>",
+        colorbar=dict(title="중요도"),
+    ))
+    fig.update_layout(
+        **PLOT_CFG,
+        height=max(400, 18 * n_feats + 100),
+        xaxis=dict(tickangle=-45),
+        yaxis=dict(autorange="reversed"),
+        margin=dict(l=160, r=50, t=30, b=100),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 상관관계 히트맵
+    st.markdown('<div class="section-hdr">🔗 주요 지표 중요도 상관관계</div>', unsafe_allow_html=True)
+    top10 = avg_imp.head(10).index.tolist()
+    corr  = fimp[top10].corr()
+    clbls = [FEAT_NAMES.get(f, f) for f in corr.index]
+
+    fig2 = go.Figure(go.Heatmap(
+        z=corr.values, x=clbls, y=clbls,
+        colorscale="RdBu", zmin=-1, zmax=1,
+        text=corr.values.round(2),
+        texttemplate="%{text}",
+        colorbar=dict(title="상관계수"),
+        hovertemplate="%{y} vs %{x}<br>%{z:.3f}<extra></extra>",
+    ))
+    fig2.update_layout(
+        **PLOT_CFG, height=420,
+        margin=dict(l=160, r=50, t=30, b=160),
+    )
+    fig2.update_xaxes(tickangle=-45)
+    st.plotly_chart(fig2, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# TAB 6 ── 실시간 AI 추천
+# ═══════════════════════════════════════════════════════════
+
+def tab_realtime(price_data: dict, fund_map: dict, tech_map: dict,
+                 results: dict, n_stocks: int):
+    st.markdown('<div class="section-hdr">🔴 실시간 AI 추천 종목 (최신 데이터 기준)</div>',
+                unsafe_allow_html=True)
+
+    fimp = results.get("fimp_df", pd.DataFrame())
+    if fimp.empty:
+        st.info("백테스트를 먼저 실행하세요.")
+        return
+
+    today = pd.Timestamp(datetime.today().date())
+
+    with st.spinner("최신 지표 계산 중..."):
+        cur_snap = build_snapshot_df(list(price_data.keys()), tech_map, fund_map, today)
+
+    if cur_snap.empty:
+        st.warning("현재 지표 데이터를 계산할 수 없습니다.")
+        return
+
+    # 최근 학습된 중요도를 가중치로 복합 점수 계산
+    latest_imp = fimp.iloc[-1]
+    avail_cols = [c for c in FEAT_COLS if c in cur_snap.columns]
+
+    # 점수 계산: 각 피처를 백분위 순위로 변환 후 중요도 가중합
+    score_df = cur_snap[avail_cols].copy()
+
+    # 방향성 처리 (낮을수록 좋은 지표는 역방향)
+    reverse_cols = {"P_E", "P_B", "P_S", "EV_EBITDA", "P_FCF",
+                    "Volatility_30d", "Volatility_90d", "Debt_Equity"}
+
+    ranked = pd.DataFrame(index=score_df.index)
+    for col in avail_cols:
+        asc = col not in reverse_cols
+        ranked[col] = score_df[col].rank(pct=True, ascending=asc, na_option="bottom")
+
+    weights = latest_imp.reindex(avail_cols).fillna(0)
+    composite = ranked.mul(weights, axis=1).sum(axis=1)
+    composite = composite / composite.max()
+
+    top_recs = composite.nlargest(n_stocks)
+    all_recs  = composite.sort_values(ascending=False)  # 전체 종목 정렬
+
+    # ── 전체 종목 상세 테이블 ──────────────────────────────
+    st.markdown(f"**{today.strftime('%Y-%m-%d')} 기준 전체 분석 종목 AI 점수 순위 ({len(all_recs)}개)**")
+    rec_rows = []
+    for rank, (t, score) in enumerate(all_recs.items(), 1):
+        row = {"순위": rank, "티커": t, "AI 점수": round(score, 3),
+               "추천": "★ 추천" if t in top_recs.index else ""}
+        for col, fmt in [
+            ("Mom_1m",  "pct"), ("Mom_3m",  "pct"), ("Mom_6m",  "pct"),
+            ("RSI_14",  "f1"),  ("P_E",     "f1"),  ("P_B",     "f2"),
+            ("ROE",     "pct"), ("Op_Margin","pct"), ("Volatility_30d","pct"),
+            ("Div_Yield","pct"),("EV_EBITDA","f1"),
+        ]:
+            if col in cur_snap.columns and t in cur_snap.index:
+                v = cur_snap.loc[t, col]
+                if pd.isna(v):
+                    row[FEAT_NAMES.get(col, col)] = "N/A"
+                elif fmt == "pct":
+                    row[FEAT_NAMES.get(col, col)] = f"{v:.2%}"
+                elif fmt == "f1":
+                    row[FEAT_NAMES.get(col, col)] = f"{v:.1f}"
+                else:
+                    row[FEAT_NAMES.get(col, col)] = f"{v:.2f}"
+        rec_rows.append(row)
+
+    rec_df = pd.DataFrame(rec_rows)
+    st.dataframe(rec_df, use_container_width=True, hide_index=True, height=420)
+
+    # 점수 막대 그래프
+    fig = go.Figure(go.Bar(
+        x=top_recs.index, y=top_recs.values,
+        marker=dict(color=top_recs.values, colorscale="Viridis", showscale=True,
+                    colorbar=dict(title="AI 점수")),
+        hovertemplate="%{x}<br>AI 점수: %{y:.3f}<extra></extra>",
+    ))
+    fig.update_layout(
+        **PLOT_CFG, height=320,
+        title=f"AI 추천 종목 점수 ({today.strftime('%Y-%m-%d')})",
+        xaxis_title="티커", yaxis_title="AI 점수",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 현재 모델 지표 중요도
+    st.markdown('<div class="section-hdr">🔑 현재 AI 모델 지표 중요도 (최신 리밸런싱 기준)</div>',
+                unsafe_allow_html=True)
+    top_imp = latest_imp.sort_values(ascending=False).head(15)
+    fig2 = go.Figure(go.Bar(
+        x=[FEAT_NAMES.get(f, f) for f in top_imp.index],
+        y=top_imp.values,
+        marker=dict(color=top_imp.values, colorscale="Plasma"),
+        hovertemplate="%{x}<br>중요도: %{y:.4f}<extra></extra>",
+    ))
+    fig2.update_layout(
+        **PLOT_CFG, height=300, xaxis_tickangle=-45,
+        title="현재 지표 중요도 TOP 15",
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # 추천 종목 레이더 차트
+    if len(top_recs) >= 3:
+        st.markdown('<div class="section-hdr">🕸️ TOP 5 종목 지표 레이더</div>', unsafe_allow_html=True)
+        radar_feats = ["Mom_3m", "RSI_14", "ROE", "Op_Margin", "Mom_6m",
+                       "Volatility_30d", "P_B", "Rev_Growth"]
+        radar_feats = [f for f in radar_feats if f in cur_snap.columns]
+
+        fig3 = go.Figure()
+        for t in top_recs.index[:5]:
+            if t not in cur_snap.index:
+                continue
+            vals = []
+            for f in radar_feats:
+                v = cur_snap.loc[t, f]
+                # 백분위 변환
+                rk = cur_snap[f].rank(pct=True)
+                vals.append(float(rk.get(t, 0.5)))
+            vals.append(vals[0])
+            labels = [FEAT_NAMES.get(f, f) for f in radar_feats] + [FEAT_NAMES.get(radar_feats[0], radar_feats[0])]
+            fig3.add_trace(go.Scatterpolar(
+                r=vals, theta=labels, fill="toself", name=t,
+            ))
+        fig3.update_layout(
+            **PLOT_CFG, height=400,
+            polar=dict(
+                bgcolor="rgba(20,25,40,0.8)",
+                radialaxis=dict(visible=True, range=[0, 1]),
+            ),
         )
-    with dl2:
-        if not recommend_all.empty:
-            st.download_button(
-                "🎯 AI 추천 종목 (CSV)",
-                data=recommend_all[display_cols].to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"recommendation_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv", use_container_width=True,
+        st.plotly_chart(fig3, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════
+# TOP BAR (모바일 대응 상단 설정 바)
+# ═══════════════════════════════════════════════════════════
+
+def render_topbar(sp500_df: pd.DataFrame, all_sectors: list) -> dict:
+    """사이드바 대신 페이지 상단 가로 배치 설정 UI."""
+
+    with st.expander("⚙️ 백테스트 설정 펼치기 / 접기", expanded=True):
+
+        # ── Row 1: 섹터 선택 ───────────────────────────────
+        st.markdown("**📂 분석 섹터 선택** (복수 선택 가능)")
+        default_sectors = ["Information Technology"] if "Information Technology" in all_sectors else all_sectors[:1]
+        sel_sectors = st.multiselect(
+            "GICS 섹터",
+            all_sectors,
+            default=default_sectors,
+            label_visibility="collapsed",
+            help="포함할 GICS 섹터를 선택하세요",
+        )
+        if not sel_sectors:
+            sel_sectors = all_sectors[:2]
+
+        universe = sp500_df[sp500_df["sector"].isin(sel_sectors)]["ticker"].tolist()
+        st.caption(f"선택된 유니버스: **{len(universe)}**개 종목")
+
+        st.markdown("---")
+
+        # ── Row 2: 핵심 파라미터 + 실행 버튼 ──────────────
+        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
+        with c1:
+            rebal_m = st.slider(
+                "리밸런싱 기간 (개월)", 1, 12, 1, 1,
+                help="포트폴리오 리밸런싱 주기",
             )
-    dl3, dl4 = st.columns(2)
-    with dl3:
-        if rebalance_details:
-            history_dfs = []
-            for detail in rebalance_details:
-                tmp = detail["selected_data"].copy()
-                tmp.insert(0, "Rebalance_Date", detail["date"])
-                history_dfs.append(tmp)
-            st.download_button(
-                "📜 리밸런싱 히스토리 (CSV)",
-                data=pd.concat(history_dfs, ignore_index=True).to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"history_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv", use_container_width=True,
+        with c2:
+            rolling_w = st.slider(
+                "롤링 학습 윈도우 (기간 수)", 2, 12, 4, 1,
+                help="모델 학습에 사용할 이전 리밸런싱 기간 수",
             )
-    with dl4:
-        raw_list = []
-        for detail in rebalance_details:
-            raw_step = fetch_ml_data_optimized_pit(
-                tickers, pd.to_datetime(detail["date"]),
-                full_hist_data, source_cache, is_training=False,
+        with c3:
+            n_stocks = st.slider("투자 종목 수", 1, 20, 5, 1)
+        with c4:
+            tc_pct = st.number_input(
+                "거래비용 (%)", min_value=0.0, max_value=5.0,
+                value=0.3, step=0.05, format="%.2f",
+                help="왕복 총 거래비용 (수수료 + 슬리피지)",
             )
-            raw_step.insert(0, "Data_Date", detail["date"])
-            raw_list.append(raw_step)
-        if raw_list:
-            st.download_button(
-                "📊 원본 피처 데이터 (CSV)",
-                data=pd.concat(raw_list, ignore_index=True).to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"raw_features_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv", use_container_width=True,
+        with c5:
+            st.markdown("<br>", unsafe_allow_html=True)
+            run_btn = st.button("🚀 실행", type="primary", use_container_width=True)
+
+        # ── Row 3: 날짜 설정 ────────────────────────────────
+        # 유의미한 백테스트: rolling_win + min_test_periods 개 리밸런싱 날짜 필요
+        # 날짜 수 = rolling_w + MIN_TEST + 1 (마지막 날짜는 forward return 종료점)
+        MIN_TEST    = 5   # 최소 테스트(예측) 횟수
+        auto_months = (rolling_w + MIN_TEST) * rebal_m + 12  # +12개월 지표 warm-up
+        auto_end    = datetime.today()
+        auto_start  = auto_end - timedelta(days=int(auto_months * 30.5))
+
+        use_custom = st.checkbox("날짜 직접 입력", value=False)
+        if use_custom:
+            dc1, dc2 = st.columns(2)
+            sd = dc1.date_input("시작일", value=auto_start.date())
+            ed = dc2.date_input("종료일", value=auto_end.date(), min_value=sd)
+        else:
+            sd = auto_start.date()
+            ed = auto_end.date()
+            st.info(
+                f"📅 자동 설정: **{sd}** ~ **{ed}** "
+                f"(약 {auto_months}개월 | 최소 {MIN_TEST}회 테스트 보장 | "
+                f"리밸런싱 1회 = {rebal_m}개월)"
             )
 
-else:
-    st.info("섹터를 선택하고 백테스트를 실행하세요.")
+    return {
+        "sectors":     sel_sectors,
+        "universe":    universe,
+        "rebal_m":     rebal_m,
+        "rolling_w":   rolling_w,
+        "start":       datetime(sd.year, sd.month, sd.day),
+        "end":         datetime(ed.year, ed.month, ed.day),
+        "n_stocks":    n_stocks,
+        "tc_pct":      tc_pct,
+        "run":         run_btn,
+        "min_test":    MIN_TEST,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
+
+def main():
+    st.markdown('<div class="main-title">📊 AI Quant Lab 2.0</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-title">AI 기반 퀀트 백테스팅 & 실시간 종목 추천 플랫폼 · '
+        'Random Forest · IC 분석 · 50+ 지표</div>',
+        unsafe_allow_html=True,
+    )
+
+    # S&P 500 목록 로드
+    with st.spinner("S&P 500 종목 목록 로드 중..."):
+        sp500_df, all_sectors = get_sp500_info()
+
+    cfg = render_topbar(sp500_df, all_sectors)
+
+    # ── 세션 상태 초기화 ──────────────────────────────────
+    for k in ["results", "benchmarks", "price_data", "fund_map", "tech_map", "cfg"]:
+        if k not in st.session_state:
+            st.session_state[k] = None
+
+    # ── 환영 화면 ─────────────────────────────────────────
+    if not cfg["run"] and st.session_state.results is None:
+        st.info("위 설정 바에서 원하는 조건을 선택한 후 **🚀 실행** 버튼을 누르세요.")
+        c1, c2, c3, c4 = st.columns(4)
+        for col, icon, title, items in [
+            (c1, "🧠", "AI 모델", ["Random Forest 예측", "롤링 윈도우 학습", "피처 중요도 추출"]),
+            (c2, "📐", "지표 (50+)", ["기술지표 25종", "펀더멘털 25종", "복합 지표"]),
+            (c3, "📊", "분석 뷰", ["IC 분석", "리밸런싱 히스토리", "지표 히트맵"]),
+            (c4, "🔴", "실시간", ["AI 추천 종목", "레이더 차트", "복합 점수 랭킹"]),
+        ]:
+            col.markdown(
+                f"**{icon} {title}**\n" + "".join(f"\n- {i}" for i in items)
+            )
+        return
+
+    # 위젯 트리 안정화: st.tabs()가 항상 동일한 위치(위젯 카운터)에 렌더링되도록
+    # if cfg["run"] 안에 두면 백테스트 실행 시와 결과 조회 시 st.tabs()의
+    # 자동 키가 달라져 탭 상태가 초기화되는 버그가 발생함
+    _status_slot = st.empty()
+    _prog_slot   = st.empty()
+
+    # ── 백테스트 실행 ─────────────────────────────────────
+    if cfg["run"]:
+        universe = cfg["universe"]
+        if not universe:
+            _status_slot.error("섹터를 선택해주세요.")
+            return
+
+        _prog_slot.progress(0)
+
+        def update_prog(val, msg):
+            _prog_slot.progress(val, msg)
+            _status_slot.info(msg)
+
+        # 1. 가격 데이터
+        update_prog(0.03, f"📡 {len(universe)}개 종목 가격 데이터 다운로드 중...")
+        data_start = cfg["start"] - timedelta(days=400)  # 지표 warm-up
+        price_data = download_price_data(
+            tuple(universe),
+            data_start.strftime("%Y-%m-%d"),
+            cfg["end"].strftime("%Y-%m-%d"),
+        )
+        if not price_data:
+            st.error("가격 데이터를 불러올 수 없습니다.")
+            return
+
+        available = list(price_data.keys())
+        update_prog(0.12, f"✅ {len(available)}개 종목 가격 데이터 수신. 펀더멘털 로드 중...")
+
+        # 2. 펀더멘털 데이터
+        fund_map = get_fundamental_yf(tuple(available))
+        fund_ok  = sum(1 for v in fund_map.values() if v)
+        update_prog(0.20, f"✅ 펀더멘털 완료: {fund_ok}/{len(available)}개. 기술지표 계산 중...")
+
+        # 3. 기술지표 사전 계산
+        tech_map = {}
+        for t, ohlcv in price_data.items():
+            try:
+                tech_map[t] = calc_all_technical(ohlcv)
+            except Exception:
+                pass
+        update_prog(0.28, f"📈 기술지표 계산 완료 ({len(tech_map)}종목). 백테스트 시작...")
+
+        # 4. 리밸런싱 날짜 생성
+        # 유의미한 백테스트 조건:
+        #   전체 날짜 수 >= rolling_w(학습) + MIN_TEST(예측) + 1(마지막 forward return 끝점)
+        MIN_TEST    = cfg.get("min_test", 5)
+        rebal_dates = generate_rebalance_dates(cfg["start"], cfg["end"], cfg["rebal_m"])
+        n_needed    = cfg["rolling_w"] + MIN_TEST  # 최소 테스트 횟수 = MIN_TEST
+        if len(rebal_dates) < n_needed + 1:
+            needed_months = (n_needed + 1) * cfg["rebal_m"] + 12
+            st.error(
+                f"백테스트 기간이 부족합니다. "
+                f"최소 {n_needed + 1}개 리밸런싱 날짜 필요 (현재 {len(rebal_dates)}개). "
+                f"학습 {cfg['rolling_w']}회 + 테스트 {MIN_TEST}회 + 지표 warm-up 1년 = "
+                f"약 {needed_months}개월 이상의 기간이 필요합니다. "
+                f"날짜를 자동 설정으로 변경하거나 시작일을 앞당겨 주세요."
+            )
+            return
+
+        # 5. 백테스트
+        results = run_backtest(
+            price_data=price_data,
+            fund_map=fund_map,
+            tech_map=tech_map,
+            rebal_dates=rebal_dates,
+            n_stocks=cfg["n_stocks"],
+            tc_pct=cfg["tc_pct"],
+            rolling_win=cfg["rolling_w"],
+            progress=update_prog,
+        )
+
+        # 6. 벤치마크 데이터
+        benchmarks = get_benchmark_prices(
+            cfg["start"].strftime("%Y-%m-%d"),
+            cfg["end"].strftime("%Y-%m-%d"),
+        )
+
+        # 저장
+        st.session_state.results    = results
+        st.session_state.benchmarks = benchmarks
+        st.session_state.price_data = price_data
+        st.session_state.fund_map   = fund_map
+        st.session_state.tech_map   = tech_map
+        st.session_state.cfg        = cfg
+
+        _prog_slot.progress(1.0, "✅ 완료!")
+        time.sleep(0.4)
+        _prog_slot.empty()
+        _status_slot.success(
+            f"✅ 백테스트 완료! "
+            f"{len(rebal_dates)}회 리밸런싱 | "
+            f"{len(results['rebal_hist'])}회 학습 | "
+            f"{len(available)}개 종목 분석"
+        )
+
+    # ── 결과 표시 ─────────────────────────────────────────
+    if st.session_state.results is not None:
+        results    = st.session_state.results
+        benchmarks = st.session_state.benchmarks or {}
+        price_data = st.session_state.price_data or {}
+        fund_map   = st.session_state.fund_map   or {}
+        tech_map   = st.session_state.tech_map   or {}
+        saved_cfg  = st.session_state.cfg        or cfg
+
+        tabs = st.tabs([
+            "📈 성과 비교",
+            "🎯 IC 분석",
+            "📋 리밸런싱 히스토리",
+            "🔍 지표 중요도",
+            "🗺️ 영향력 히트맵",
+            "🔴 실시간 추천",
+        ])
+
+        with tabs[0]:
+            tab_performance(results, benchmarks, price_data)
+        with tabs[1]:
+            tab_ic(results)
+        with tabs[2]:
+            tab_history(results)
+        with tabs[3]:
+            tab_importance(results)
+        with tabs[4]:
+            tab_heatmap(results)
+        with tabs[5]:
+            tab_realtime(price_data, fund_map, tech_map, results,
+                         saved_cfg.get("n_stocks", 10))
+
+
+if __name__ == "__main__":
+    main()
