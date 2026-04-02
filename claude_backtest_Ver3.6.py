@@ -48,6 +48,15 @@ st.markdown("""
     .stApp { background: #ffffff; }
     section[data-testid="stSidebar"] { display: none; }
 
+    /* ── Streamlit 기본 UI 숨김 (Share·GitHub·Manage app 등) ── */
+    #MainMenu { display: none; }
+    header[data-testid="stHeader"] { display: none; }
+    footer { display: none; }
+    div[data-testid="manage-app-button"] { display: none; }
+    .stDeployButton { display: none; }
+    div[data-testid="stToolbar"] { display: none; }
+    div[data-testid="stStatusWidget"] { display: none; }
+
     .main-title {
         font-size: 2.0rem; font-weight: 800;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
